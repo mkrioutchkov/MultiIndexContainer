@@ -48,6 +48,12 @@
 #include <format>
 #include <string>
 #include <expected>
+#if __has_include(<generator>)
+#  include <generator>
+#  define MIC_HAS_GENERATOR 1
+#else
+#  define MIC_HAS_GENERATOR 0
+#endif
 
 #if defined(_MSC_VER)
 #  define MIC_NO_UNIQUE_ADDRESS [[msvc::no_unique_address]]
@@ -96,6 +102,20 @@ constexpr const Class& to_ref(const X& x) {
     }
 }
 
+// Mutable counterpart of to_ref, used by modify_key() to hand the mutator a
+// writable reference to a member key (reaches through pointer-like elements).
+template <class Class, class X>
+constexpr Class& to_ref_mut(X& x) {
+    using U = std::remove_cvref_t<X>;
+    if constexpr (std::is_same_v<U, Class> || std::is_base_of_v<Class, U>) {
+        return x;
+    } else if constexpr (is_reference_wrapper<U>::value) {
+        return to_ref_mut<Class>(x.get());
+    } else {
+        return to_ref_mut<Class>(*x);
+    }
+}
+
 template <class T> struct is_tuple : std::false_type {};
 template <class... Us> struct is_tuple<std::tuple<Us...>> : std::true_type {};
 
@@ -121,6 +141,8 @@ struct identity {
 template <class Class, class Type, Type Class::* P>
 struct member {
     using result_type = Type;
+    using class_type  = Class;                       // exposed so modify_key() can
+    static constexpr Type Class::* member_ptr = P;   // hand back a writable key ref
     template <detail::reachable<Class> X> constexpr const Type& operator()(const X& x) const { return detail::to_ref<Class>(x).*P; }
 };
 
@@ -329,6 +351,20 @@ struct indexed_by {
     using specs = std::tuple<Specs...>;
     static constexpr std::size_t count = sizeof...(Specs);
 };
+
+// Policy for modify()/replace() when a key change collides with a unique index.
+//   keep  : roll back the change, leave the element in place (default; mic/std-like)
+//   erase : drop the element entirely (Boost.MultiIndex's legacy behaviour)
+enum class on_collision { keep, erase };
+
+// Range-bound machinery for ordered_index.range() (declared early so the proxy,
+// defined inside the container, can see it; the key_ge/gt/le/lt helpers and the
+// `unbounded` constant that build these live near the other free helpers below).
+namespace detail {
+enum class bound_kind { ge, gt, le, lt };
+template <class K> struct range_bound { K key; bound_kind kind; };
+struct unbounded_t {};
+}
 
 // ---------------------------------------------------------------------------
 //  Index cores (parameterised on the node pointer)
@@ -779,6 +815,19 @@ struct core_for<random_access<T>, NP, A, I> { using type = rand_core<NP, A>; };
 template <class C, class = void> struct core_key { using type = void; };
 template <class C> struct core_key<C, std::void_t<typename C::key_type>> { using type = typename C::key_type; };
 
+// Spec::compare exists only on ordered/ranked specs; yield 'void' elsewhere so a
+// generic 'using key_compare = ...' never hard-errors on a hashed/keyless spec.
+template <class Spec, class = void> struct spec_compare { using type = void; };
+template <class Spec> struct spec_compare<Spec, std::void_t<typename Spec::compare>> { using type = typename Spec::compare; };
+
+// "Can std::format render this?" — checks the formatter has a usable format(). More
+// reliable than std::formattable on MSVC, which rejects formatters that inherit from
+// std::formatter<std::string> even though std::format accepts them.
+template <class T>
+concept formattable_value =
+    requires(std::formatter<std::remove_cvref_t<T>, char> f, const std::remove_cvref_t<T>& t, std::format_context c)
+    { f.format(t, c); };
+
 } // namespace detail
 
 // ---------------------------------------------------------------------------
@@ -812,8 +861,11 @@ template <class T> using pointee_t = typename pointee<T>::type;
 // indices' backs through the stored pointer — writes must go through
 // modify()/replace(). It is a no-op for value (non-pointer) elements, which are
 // already const-protected. See const_element_container below.
-struct standard_policy      { static constexpr bool const_elements = false; };
-struct const_element_policy { static constexpr bool const_elements = true;  };
+struct standard_policy      { static constexpr bool const_elements = false; static constexpr bool observable = false; };
+struct const_element_policy { static constexpr bool const_elements = true;  static constexpr bool observable = false; };
+// Opt into lifecycle observers (subscribe()); zero per-op cost until the first
+// subscriber. See mic::observed below.
+struct observed_policy      { static constexpr bool const_elements = false; static constexpr bool observable = true;  };
 
 // ===========================================================================
 //  multi_index_container
@@ -886,6 +938,58 @@ private:
     node* rhead_ = nullptr;          // intrusive registry: head/tail of all live nodes
     node* rtail_ = nullptr;
     std::size_t   size_{0};
+
+    // ---- lifecycle observers (present only under observed_policy) ----------
+public:
+    // Callback set; fields default to empty (unfired). Build with designated
+    // initialisers: subscribe({ .on_insert = ..., .on_erase = ... }).
+    struct observer {
+        std::function<void(const Value&)> on_insert;
+        std::function<void(const Value&)> on_erase;
+        std::function<void(const Value&)> on_modify;
+    };
+private:
+    struct obs_state {
+        std::vector<std::pair<std::uint64_t, observer>> list;
+        std::uint64_t next = 0;
+    };
+    // shared_ptr so a subscription token can outlive container moves; monostate
+    // (0 bytes) and entirely compiled out when the policy is not observable.
+    MIC_NO_UNIQUE_ADDRESS std::conditional_t<Policy::observable, std::shared_ptr<obs_state>, std::monostate> obs_{};
+
+    void fire_insert(const Value& v) { if constexpr (Policy::observable) if (obs_) for (auto& [id, o] : obs_->list) if (o.on_insert) o.on_insert(v); }
+    void fire_erase (const Value& v) { if constexpr (Policy::observable) if (obs_) for (auto& [id, o] : obs_->list) if (o.on_erase)  o.on_erase(v);  }
+    void fire_modify(const Value& v) { if constexpr (Policy::observable) if (obs_) for (auto& [id, o] : obs_->list) if (o.on_modify) o.on_modify(v); }
+public:
+    // RAII subscription handle: observation stops when it is destroyed.
+    class subscription {
+        std::weak_ptr<obs_state> st_;
+        std::uint64_t            id_ = 0;
+        friend class multi_index_container;
+        subscription(std::shared_ptr<obs_state> st, std::uint64_t id) : st_(std::move(st)), id_(id) {}
+    public:
+        subscription() = default;
+        subscription(subscription&& o) noexcept : st_(std::move(o.st_)), id_(o.id_) { o.st_.reset(); }
+        subscription& operator=(subscription&& o) noexcept {
+            if (this != &o) { unsubscribe(); st_ = std::move(o.st_); id_ = o.id_; o.st_.reset(); }
+            return *this;
+        }
+        subscription(const subscription&) = delete;
+        subscription& operator=(const subscription&) = delete;
+        ~subscription() { unsubscribe(); }
+        void unsubscribe() {
+            if (auto s = st_.lock()) std::erase_if(s->list, [&](auto& p) { return p.first == id_; });
+            st_.reset();
+        }
+    };
+    // Register a callback set; returns an RAII token (drop it to stop observing).
+    subscription subscribe(observer o) requires (Policy::observable) {
+        if (!obs_) obs_ = std::make_shared<obs_state>();
+        std::uint64_t id = obs_->next++;
+        obs_->list.emplace_back(id, std::move(o));
+        return subscription{ obs_, id };
+    }
+private:
 
     template <std::size_t... I>
     static cores_tuple make_cores(const Alloc& a, std::index_sequence<I...>) {
@@ -1012,6 +1116,7 @@ private:
             return { it, false };
         }
         reg_push_back(p); ++size_;
+        fire_insert(p->value);
         return { make_iter<0>(p), true };
     }
 
@@ -1070,14 +1175,16 @@ private:
     // (matching Boost's "modify does not invalidate iterators"). Rollback-and-keep
     // on a unique clash; strong guarantee if the mutator throws (no index touched).
     template <class F>
-    bool modify_node(node* p, F&& f) {
+    bool modify_node(node* p, F&& f, on_collision mode = on_collision::keep) {
         static_assert(std::is_copy_constructible_v<Value>,
                       "modify() rollback requires a copy-constructible value_type");
         oldkeys_tuple oldk; capture_keys(p->value, oldk);
         Value snapshot = p->value;
         try { std::forward<F>(f)(p->value); }
         catch (...) { p->value = std::move(snapshot); throw; }
-        return reposition(p, oldk, snapshot);
+        bool ok = reposition(p, oldk, snapshot, mode);
+        if (ok) fire_modify(p->value);
+        return ok;
     }
     template <class V>
     bool replace_node(node* p, V&& v) {
@@ -1087,12 +1194,48 @@ private:
         Value snapshot = std::move(p->value);
         try { p->value = std::forward<V>(v); }
         catch (...) { p->value = std::move(snapshot); throw; }
-        return reposition(p, oldk, snapshot);
+        bool ok = reposition(p, oldk, snapshot);
+        if (ok) fire_modify(p->value);
+        return ok;
+    }
+    // expected-returning twins: on a unique collision they name the offending index
+    // (and the blocking element) instead of returning a bare bool. Always keep-on-
+    // collision (the element stays put); success yields the (unchanged) node.
+    template <class F>
+    std::expected<node*, insert_error<Value>> try_modify_node(node* p, F&& f) {
+        static_assert(std::is_copy_constructible_v<Value>, "try_modify() requires a copy-constructible value_type");
+        oldkeys_tuple oldk; capture_keys(p->value, oldk);
+        Value snapshot = p->value;
+        try { std::forward<F>(f)(p->value); }
+        catch (...) { p->value = std::move(snapshot); throw; }
+        return finish_reposition(p, oldk, snapshot);
+    }
+    template <class V>
+    std::expected<node*, insert_error<Value>> try_replace_node(node* p, V&& v) {
+        static_assert(std::is_move_constructible_v<Value>, "try_replace() requires a move-constructible value_type");
+        oldkeys_tuple oldk; capture_keys(p->value, oldk);
+        Value snapshot = std::move(p->value);
+        try { p->value = std::forward<V>(v); }
+        catch (...) { p->value = std::move(snapshot); throw; }
+        return finish_reposition(p, oldk, snapshot);
+    }
+    std::expected<node*, insert_error<Value>> finish_reposition(node* p, const oldkeys_tuple& oldk, Value& snapshot) {
+        node* conflict = nullptr; std::size_t failed = N;
+        if (reposition(p, oldk, snapshot, on_collision::keep, &conflict, &failed)) { fire_modify(p->value); return p; }
+        insert_error<Value> e;
+        e.index_pos = failed;
+        e.blocking  = conflict ? &conflict->value : nullptr;
+        visit_tag(failed, [&](std::string_view t) { e.index_tag = t; });
+        return std::unexpected(e);
     }
     // p is already mutated; `oldk` holds the pre-mutation keys, `snapshot` the
     // previous value. Move p within the indices whose key changed (all-or-nothing
-    // uniqueness); on clash, restore the snapshot and return false (element stays).
-    bool reposition(node* p, const oldkeys_tuple& oldk, Value& snapshot) {
+    // uniqueness); on clash, restore the snapshot and return false (element stays —
+    // or, under on_collision::erase, is dropped). Reports the offending index/element
+    // through the optional out-params.
+    bool reposition(node* p, const oldkeys_tuple& oldk, Value& snapshot,
+                    on_collision mode = on_collision::keep,
+                    node** out_conflict = nullptr, std::size_t* out_failed = nullptr) {
         std::array<bool, N> ch{};
         compute_changed(oldk, p->value, ch);             // p->value holds the NEW value
         // Erase the changed indices while the element still reflects its OLD keys:
@@ -1103,12 +1246,16 @@ private:
         std::swap(p->value, snapshot);                   // p->value = NEW again
         node* conflict = nullptr; std::size_t failed = N;
         if (insert_changed<0>(p, ch, conflict, failed)) return true;
-        p->value = std::move(snapshot);                  // rollback-and-keep (restore OLD keys)
+        if (out_conflict) *out_conflict = conflict;      // existing live element we clashed with
+        if (out_failed)   *out_failed   = failed;
+        p->value = std::move(snapshot);                  // restore OLD keys (fully consistent again)
         node* c2 = nullptr; std::size_t f2 = N;
-        if (!insert_changed<0>(p, ch, c2, f2)) { reg_unlink(p); destroy_node(p); --size_; }
+        if (!insert_changed<0>(p, ch, c2, f2)) { reg_unlink(p); destroy_node(p); --size_; return false; }
+        if (mode == on_collision::erase) erase_node_full(p);   // Boost legacy: drop on collision
         return false;
     }
     void erase_node_full(node* p) {
+        fire_erase(p->value);
         remove_all<0>(p);
         reg_unlink(p);
         destroy_node(p);
@@ -1152,6 +1299,19 @@ public:
         using const_iterator = iter_t<I>;
         using value_type     = Value;
 
+        // ---- this index's key (drives generic relational helpers / structured
+        //      decomposition). key_compare is 'void' on keyless (seq/random) indices.
+        using key_type      = key_t;
+        using key_extractor = typename spec_at<I>::extractor;
+        using key_compare   = typename detail::spec_compare<spec_at<I>>::type;
+        // Re-extract this index's key from an element (reaches through pointer
+        // elements exactly as the index itself does).
+        static key_type key_of(const Value& v) requires (!std::is_void_v<key_t>) { return key_extractor{}(v); }
+        // Order two elements the way this (ordered) index does.
+        static bool key_less(const Value& a, const Value& b) requires (kind == index_kind::ordered) {
+            return key_compare{}(key_extractor{}(a), key_extractor{}(b));
+        }
+
         explicit index_proxy(multi_index_container* c) : c_(c) {}
 
         static constexpr std::string_view tag() { return spec_at<I>::tag.view(); }
@@ -1174,13 +1334,46 @@ public:
 
         // ---- mutation (delegates across all indices) ----
         template <class F> bool modify(iterator it, F&& f) const { return c_->modify_node(it.get_node(), std::forward<F>(f)); }
+        template <class F> bool modify(iterator it, F&& f, on_collision m) const { return c_->modify_node(it.get_node(), std::forward<F>(f), m); }
         template <class V> bool replace(iterator it, V&& v) const { return c_->replace_node(it.get_node(), std::forward<V>(v)); }
+
+        // modify_key: hand the mutator ONLY the (writable) key. Available where the
+        // index's key is a plain data member (member<> extractor); computed/composite
+        // keys have no writable key reference, so use modify() for those.
+        template <class F> bool modify_key(iterator it, F&& f, on_collision m = on_collision::keep) const
+            requires requires { typename key_extractor::class_type; } {
+            using Cls = typename key_extractor::class_type;
+            return c_->modify_node(it.get_node(),
+                [&](Value& v) { f(detail::to_ref_mut<Cls>(v).*key_extractor::member_ptr); }, m);
+        }
+
+        // expected-returning twins: name the index that blocked a key change.
+        template <class F> std::expected<iterator, insert_error<Value>> try_modify(iterator it, F&& f) const {
+            auto r = c_->try_modify_node(it.get_node(), std::forward<F>(f));
+            if (r) return c_->template make_iter<I>(*r);
+            return std::unexpected(r.error());
+        }
+        template <class V> std::expected<iterator, insert_error<Value>> try_replace(iterator it, V&& v) const {
+            auto r = c_->try_replace_node(it.get_node(), std::forward<V>(v));
+            if (r) return c_->template make_iter<I>(*r);
+            return std::unexpected(r.error());
+        }
         iterator erase(iterator it) const {
             node* p = it.get_node();
             iterator nx = it; ++nx;
             node* nextNode = (nx == end()) ? nullptr : nx.get_node();
             c_->erase_node_full(p);
             return nextNode ? c_->template make_iter<I>(nextNode) : end();
+        }
+
+        // ---- node-handle extraction through this index (detach without freeing) ----
+        // 'auto' return: node_handle is declared later in the container, so it can't
+        // be named in the signature, but the body sees it (complete-class context).
+        auto extract(iterator it) const { return c_->extract(c_->template make_iter<0>(it.get_node())); }
+        template <class K = lookup_key_t>
+        auto extract(const K& k) const requires (kind == index_kind::ordered || kind == index_kind::hashed) {
+            auto it = find(k);
+            return it == end() ? node_handle{} : extract(it);
         }
 
         // ---- ordered / ranked lookups ----
@@ -1192,6 +1385,18 @@ public:
         template <class K = lookup_key_t> std::pair<iterator, iterator> equal_range(const K& k) const requires (kind == index_kind::ordered) {
             auto pr = core().c.equal_range(k);
             return { iterator{ pr.first }, iterator{ pr.second } };
+        }
+        // Half-open / open range query as a subrange. Bounds are mic::key_ge/gt/le/lt
+        // or mic::unbounded, e.g. range(key_ge(lo), key_lt(hi)) or range(unbounded, key_le(x)).
+        template <class Lo, class Hi>
+        std::ranges::subrange<iterator> range(const Lo& lo, const Hi& hi) const requires (kind == index_kind::ordered) {
+            auto resolve = [&](const auto& b) -> iterator {
+                return (b.kind == detail::bound_kind::ge || b.kind == detail::bound_kind::lt)
+                           ? lower_bound(b.key) : upper_bound(b.key);   // ge/lt -> lower_bound; gt/le -> upper_bound
+            };
+            iterator lo_it = [&] { if constexpr (std::is_same_v<Lo, detail::unbounded_t>) return begin(); else return resolve(lo); }();
+            iterator hi_it = [&] { if constexpr (std::is_same_v<Hi, detail::unbounded_t>) return end();   else return resolve(hi); }();
+            return std::ranges::subrange<iterator>(lo_it, hi_it);
         }
 
         // ---- hashed lookups (transparent: no key materialisation when possible) ----
@@ -1369,6 +1574,119 @@ public:
     template <fixed_string Tag> auto index() { return get<Tag>(); }
     template <std::size_t I>     auto index() { return get<I>(); }
 
+    // ---- introspection / stats (drives the std::format specs below) --------
+    struct index_stat {
+        std::string_view tag;
+        index_kind       kind;
+        bool             unique;
+        std::size_t      size;
+        float            load_factor;    // hashed only (0 otherwise)
+        std::size_t      bucket_count;   // hashed only (0 otherwise)
+    };
+    template <std::size_t I> index_stat stat_at() const {
+        using Spec = spec_at<I>;
+        index_stat s{ Spec::tag.view(), Spec::kind, Spec::unique, size_, 0.0f, 0 };
+        if constexpr (Spec::kind == index_kind::hashed) {
+            auto& c = std::get<I>(cores_).c;
+            s.bucket_count = c.bucket_count();
+            s.load_factor  = c.load_factor();
+        }
+        return s;
+    }
+    template <fixed_string Tag> index_stat stat() const { return stat_at<index_of_tag<Tag>()>(); }
+    std::vector<index_stat> all_stats() const {
+        std::vector<index_stat> v;
+        [&]<std::size_t... I>(std::index_sequence<I...>) { (v.push_back(stat_at<I>()), ...); }(std::make_index_sequence<N>{});
+        return v;
+    }
+    // staff.stats().index<"by_email">().load_factor
+    struct stats_view {
+        const multi_index_container* c;
+        template <fixed_string Tag> index_stat index() const { return c->template stat<Tag>(); }
+        std::vector<index_stat>      all()   const { return c->all_stats(); }
+    };
+    stats_view stats() const { return stats_view{ this }; }
+
+    // Renders the representation for a std::format spec: "" (summary), "stats",
+    // "audit", "full" (every element), "index=<tag>" (in that index's order).
+    // A member template so the std::formattable<Value> probe is evaluated at the
+    // call site (where the user's std::formatter<Value> is in scope).
+    template <class = void>
+    std::string debug_dump(std::string_view mode) const {
+        auto kname = [](index_kind k) -> std::string_view {
+            switch (k) { case index_kind::ordered: return "ordered"; case index_kind::hashed: return "hashed";
+                         case index_kind::sequenced: return "sequenced"; default: return "random_access"; }
+        };
+        if (mode == "stats") {
+            std::string s = std::format("multi_index size={}", size_);
+            for (const auto& st : all_stats()) {
+                s += std::format("\n  {:<16} {:<13} {}", st.tag, kname(st.kind), st.unique ? "unique" : "non-unique");
+                if (st.kind == index_kind::hashed)
+                    s += std::format("  (buckets={}, load_factor={:.2f})", st.bucket_count, st.load_factor);
+            }
+            return s;
+        }
+        if (mode == "audit") {
+            std::string issues;
+            audit_into(issues);
+            return issues.empty() ? std::format("multi_index audit: OK ({} elements across {} indices)", size_, N)
+                                  : std::format("multi_index audit: PROBLEMS\n{}", issues);
+        }
+        if (mode == "full" || mode.starts_with("index=")) {
+            if constexpr (detail::formattable_value<Value>) {
+                std::string s;
+                if (mode == "full") {
+                    s = std::format("multi_index(size={}) [insertion order]", size_);
+                    for (auto&& v : *this) s += std::format("\n  {}", v);
+                } else {
+                    std::string_view tag = mode.substr(6);
+                    s = std::format("multi_index[{}]", tag);
+                    if (!dump_index_by_tag(tag, s)) return std::format("multi_index: unknown index '{}'", tag);
+                }
+                return s;
+            } else {
+                return std::format("multi_index(size={}; value_type is not formattable)", size_);
+            }
+        }
+        return std::format("multi_index(size={})", size_);   // "" summary / fallback
+    }
+private:
+    template <class Sink> bool dump_index_by_tag(std::string_view tag, Sink& s) const requires (detail::formattable_value<Value>) {
+        auto* self = const_cast<multi_index_container*>(this);
+        bool found = false;
+        [&]<std::size_t... I>(std::index_sequence<I...>) {
+            ([&] { if (!found && spec_at<I>::tag.view() == tag) {
+                found = true;
+                for (auto&& v : self->template get<I>()) s += std::format("\n  {}", v);
+            } }(), ...);
+        }(std::make_index_sequence<N>{});
+        return found;
+    }
+    void audit_into(std::string& issues) const {
+        auto* self = const_cast<multi_index_container*>(this);
+        [&]<std::size_t... I>(std::index_sequence<I...>) {
+            ([&] {
+                using Spec = spec_at<I>;
+                auto idx = self->template get<I>();
+                std::size_t cnt = 0; for (auto it = idx.begin(); it != idx.end(); ++it) ++cnt;
+                if (cnt != size_) issues += std::format("  [{}] reachable count {} != size {}\n", Spec::tag.view(), cnt, size_);
+                if constexpr (Spec::kind == index_kind::ordered) {
+                    using Ext = typename Spec::extractor; using Cmp = typename Spec::compare;
+                    auto it = idx.begin(), e = idx.end();
+                    if (it != e) {
+                        auto kprev = Ext{}(it.get_node()->value); ++it;
+                        for (; it != e; ++it) {
+                            auto kcur = Ext{}(it.get_node()->value);
+                            if (Cmp{}(kcur, kprev)) { issues += std::format("  [{}] keys out of order\n", Spec::tag.view()); break; }
+                            kprev = kcur;
+                        }
+                    }
+                }
+            }(), ...);
+        }(std::make_index_sequence<N>{});
+    }
+public:
+
     template <fixed_string ToTag, class It> auto project(It it) {
         constexpr std::size_t J = index_of_tag<ToTag>();
         static_assert(J < N, "mic: unknown projection tag");
@@ -1396,6 +1714,7 @@ public:
 
     std::expected<iterator, insert_error<Value>> try_insert(const Value& v) { return try_insert_impl(make_node(v)); }
     std::expected<iterator, insert_error<Value>> try_insert(Value&& v)      { return try_insert_impl(make_node(std::move(v))); }
+    template <class... A> std::expected<iterator, insert_error<Value>> try_emplace(A&&... a) { return try_insert_impl(make_node(std::forward<A>(a)...)); }
 private:
     std::expected<iterator, insert_error<Value>> try_insert_impl(node* p) {
         node* conflict = nullptr; std::size_t failed = N;
@@ -1408,6 +1727,7 @@ private:
             return std::unexpected(e);
         }
         reg_push_back(p); ++size_;
+        fire_insert(p->value);
         return make_iter<0>(p);
     }
     template <class F> void visit_tag(std::size_t pos, F&& f) {
@@ -1441,6 +1761,7 @@ public:
         }
         h.p_ = nullptr;   // ownership adopted by this container
         reg_push_back(p); ++size_;
+        fire_insert(p->value);
         return { make_iter<0>(p), true, node_handle{} };
     }
     void merge(multi_index_container& other) {
@@ -1459,10 +1780,34 @@ public:
 template <class V, class I, class A, class P>
 void swap(multi_index_container<V, I, A, P>& a, multi_index_container<V, I, A, P>& b) noexcept { a.swap(b); }
 
+// Short spelling used throughout the docs/examples; identical to multi_index_container.
+template <class Value, class IndexedBy, class Alloc = std::allocator<Value>, class Policy = standard_policy>
+using multi_index = multi_index_container<Value, IndexedBy, Alloc, Policy>;
+
 // Convenience alias: a container whose iterators present pointer-like elements
 // as a const pointee view (keys can only change via modify()/replace()).
 template <class Value, class IndexedBy, class Alloc = std::allocator<Value>>
 using const_element_container = multi_index_container<Value, IndexedBy, Alloc, const_element_policy>;
+
+// Opt into lifecycle observers: t.subscribe({ .on_insert=..., .on_erase=..., .on_modify=... })
+// returns an RAII token. Zero per-operation cost until the first subscriber.
+template <class Value, class IndexedBy, class Alloc = std::allocator<Value>>
+using observed = multi_index_container<Value, IndexedBy, Alloc, observed_policy>;
+
+// prefix(a, b, ...) builds a partial composite-key tuple for prefix range queries
+// on a composite ordered index, e.g. equal_range(mic::prefix("Eng")). It is just a
+// shorter tuple; the composite comparator matches on the leading components.
+template <class... Ks>
+constexpr auto prefix(Ks&&... ks) { return std::tuple<std::decay_t<Ks>...>(std::forward<Ks>(ks)...); }
+
+// Open/half-open range bounds for ordered_index.range(lo, hi):
+//   key_ge(k) inclusive lower   key_gt(k) exclusive lower
+//   key_le(k) inclusive upper   key_lt(k) exclusive upper   mic::unbounded = open end
+inline constexpr detail::unbounded_t unbounded{};
+template <class K> constexpr auto key_ge(K&& k) { return detail::range_bound<std::decay_t<K>>{std::forward<K>(k), detail::bound_kind::ge}; }
+template <class K> constexpr auto key_gt(K&& k) { return detail::range_bound<std::decay_t<K>>{std::forward<K>(k), detail::bound_kind::gt}; }
+template <class K> constexpr auto key_le(K&& k) { return detail::range_bound<std::decay_t<K>>{std::forward<K>(k), detail::bound_kind::le}; }
+template <class K> constexpr auto key_lt(K&& k) { return detail::range_bound<std::decay_t<K>>{std::forward<K>(k), detail::bound_kind::lt}; }
 
 // std::pmr support: every allocation (element nodes AND the per-index structures)
 // flows through one std::pmr::memory_resource, so a pool / monotonic_buffer
@@ -1471,15 +1816,99 @@ namespace pmr {
 template <class Value, class IndexedBy, class Policy = ::mic::standard_policy>
 using multi_index_container =
     ::mic::multi_index_container<Value, IndexedBy, std::pmr::polymorphic_allocator<Value>, Policy>;
+template <class Value, class IndexedBy, class Policy = ::mic::standard_policy>
+using multi_index = multi_index_container<Value, IndexedBy, Policy>;
 }
+
+// ---------------------------------------------------------------------------
+//  Relational query helpers over ordered indices (lazy, std::generator-based).
+//  Both inputs must be ordered indices on the same key type/order; they are
+//  already key-sorted, so these are O(n+m) sort-merge / linear-scan algorithms.
+// ---------------------------------------------------------------------------
+namespace queries {
+namespace detail {
+template <class Proxy>
+concept ordered_side =
+    requires { typename Proxy::value_type; typename Proxy::key_type; typename Proxy::key_compare; } &&
+    !std::is_void_v<typename Proxy::key_compare> &&
+    requires(const typename Proxy::value_type& v) { { Proxy::key_of(v) }; };
+} // namespace detail
+
+#if MIC_HAS_GENERATOR
+// Inner equi-join: yields {a, b} for every pair whose join keys are equal,
+// including the full cross product when either side has duplicate keys (SQL
+// inner-join semantics). The LEFT side's comparator orders both streams.
+template <class ProxyA, class ProxyB>
+    requires (detail::ordered_side<ProxyA> && detail::ordered_side<ProxyB>)
+std::generator<std::pair<const typename ProxyA::value_type&,
+                         const typename ProxyB::value_type&>>
+equi_join(ProxyA a, ProxyB b) {
+    using A = typename ProxyA::value_type;
+    using B = typename ProxyB::value_type;
+    static_assert(std::is_same_v<typename ProxyA::key_type, typename ProxyB::key_type>,
+                  "equi_join requires both indices to share the same key type");
+    typename ProxyA::key_compare less{};
+    auto ia = a.begin(); const auto ea = a.end();
+    auto ib = b.begin(); const auto eb = b.end();
+    std::vector<const B*> bgroup;
+    while (ia != ea && ib != eb) {
+        auto ka = ProxyA::key_of(*ia);
+        auto kb = ProxyB::key_of(*ib);
+        if      (less(ka, kb)) { ++ia; }            // a behind -> advance a
+        else if (less(kb, ka)) { ++ib; }            // b behind -> advance b
+        else {                                      // equal keys -> emit cross product
+            bgroup.clear();
+            auto kg = kb;
+            do { bgroup.push_back(&*ib); ++ib; }
+            while (ib != eb && !less(kg, ProxyB::key_of(*ib)) && !less(ProxyB::key_of(*ib), kg));
+            do {
+                const A& ar = *ia;
+                for (const B* pb : bgroup) co_yield std::pair<const A&, const B&>(ar, *pb);
+                ++ia;
+            } while (ia != ea && !less(kg, ProxyA::key_of(*ia)) && !less(ProxyA::key_of(*ia), kg));
+        }
+    }
+}
+
+// group_by: yields {key, subrange} for each run of equal-keyed elements in an
+// ordered index, in key order. `group` is a borrowed subrange of the index.
+template <class Proxy>
+    requires detail::ordered_side<Proxy>
+std::generator<std::pair<typename Proxy::key_type,
+                         std::ranges::subrange<typename Proxy::iterator>>>
+group_by(Proxy a) {
+    typename Proxy::key_compare less{};
+    auto it = a.begin(); const auto e = a.end();
+    while (it != e) {
+        auto k = Proxy::key_of(*it);
+        auto run = it;
+        do { ++it; } while (it != e && !less(k, Proxy::key_of(*it)) && !less(Proxy::key_of(*it), k));
+        co_yield std::pair<typename Proxy::key_type, std::ranges::subrange<typename Proxy::iterator>>(
+            k, std::ranges::subrange<typename Proxy::iterator>(run, it));
+    }
+}
+#endif // MIC_HAS_GENERATOR
+} // namespace queries
 
 } // namespace mic
 
-// ---- std::format summary ---------------------------------------------------
+// ---- std::format support ---------------------------------------------------
+//  "{}"            -> multi_index(size=N)
+//  "{:full}"       -> every element (requires a formattable value_type)
+//  "{:index=tag}"  -> every element in that index's order
+//  "{:stats}"      -> per-index kind/uniqueness, hashed load factors
+//  "{:audit}"      -> invariant-audit report
 template <class V, class I, class A, class P>
-struct std::formatter<mic::multi_index_container<V, I, A, P>> : std::formatter<std::string> {
+struct std::formatter<mic::multi_index_container<V, I, A, P>> {
+    char buf_[32]{};
+    std::size_t len_ = 0;
+    constexpr auto parse(std::format_parse_context& ctx) {
+        auto it = ctx.begin();
+        while (it != ctx.end() && *it != '}' && len_ < sizeof(buf_) - 1) { buf_[len_++] = *it; ++it; }
+        return it;
+    }
     auto format(const mic::multi_index_container<V, I, A, P>& m, std::format_context& ctx) const {
-        return std::formatter<std::string>::format(std::format("multi_index(size={})", m.size()), ctx);
+        return std::format_to(ctx.out(), "{}", m.debug_dump(std::string_view(buf_, len_)));
     }
 };
 

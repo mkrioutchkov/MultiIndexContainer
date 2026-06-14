@@ -22,6 +22,9 @@ Win32/
 .idea/
 *.user
 
+# Claude Code worktrees / local agent scratch
+.claude/
+
 # CMake
 CMakeCache.txt
 CMakeFiles/

@@ -70,11 +70,24 @@ for (const Employee& e : s.get<"by_salary">() | std::views::reverse) { /* high�
   allocation (element nodes **and** all per-index structures) through one
   `std::pmr::memory_resource`, so a pool / `monotonic_buffer_resource` serves the
   whole container.
-* **Modern API** — `std::expected`-returning `try_insert` whose `insert_error`
-  names *which* unique index rejected the insert (by tag) **and** points at the
-  blocking element — a diagnostic Boost doesn't surface; `std::ranges`-ready
-  index views (compose `views::filter` / `reverse` / `take`), `std::format`
-  support, and `std::from_range` construction.
+* **Modern API** — `std::expected`-returning `try_insert` / `try_emplace` /
+  `try_modify` / `try_replace` whose `insert_error` names *which* unique index
+  rejected the change (by tag) **and** points at the blocking element — a
+  diagnostic Boost doesn't surface; `std::ranges`-ready index views (compose
+  `views::filter` / `reverse` / `take`), and `std::from_range` construction.
+* **Open-ended range scans** — `index.range(mic::key_ge(lo), mic::key_lt(hi))`
+  with `mic::unbounded` sides; `mic::prefix(...)` for composite-key prefix queries.
+* **Relational helpers** — `mic::queries::equi_join(a, b)` (lazy sort-merge inner
+  join of two ordered indices on a shared key) and `mic::queries::group_by(a)`,
+  both returning `std::generator` (O(n+m), O(1) space).
+* **`std::format` introspection** — `"{}"` summary, `"{:stats}"` (per-index kind /
+  uniqueness / hashed load factors), `"{:audit}"` (invariant check), `"{:full}"`
+  and `"{:index=tag}"` element dumps, plus a structured `container.stats()`.
+* **Lifecycle observers** — opt into `mic::observed<...>`; `subscribe({.on_insert=…,
+  .on_erase=…, .on_modify=…})` returns an RAII token. Zero per-op cost until the
+  first subscriber, nothing at all on a plain container.
+* **`mic::modify_key` / `on_collision::erase`** — edit just the key, and opt into
+  Boost's legacy erase-on-collision per call.
 
 ## Key safety with pointer elements
 
@@ -141,7 +154,10 @@ flags, allocation profiling, and `perf` / VTune / Google Benchmark workflows.
   order book, const-element safety, observer registry, symbol table,
   [insert diagnostics](examples/insert_diagnostics.cpp) (*which* index rejected
   an insert), [composite keys](examples/composite_keys.cpp) (full + prefix
-  lookups), and a [modern-API tour](examples/modern_api.cpp).
+  lookups), a [modern-API tour](examples/modern_api.cpp),
+  [relational queries](examples/relational_queries.cpp) (`equi_join` / `group_by`
+  / range scans), and an [observed table](examples/observed_table.cpp)
+  (lifecycle observers + `std::format` introspection).
 * [`playground/`](playground) — a Visual Studio project; open the `.sln`, press F5.
 
 ## Status & v1 limitations
