@@ -217,12 +217,14 @@ So you can sanity-check your results against the implementation:
 
 * **Ordered `find`** ≈ `std::set`/`std::map` find, plus one pointer indirection
   (node → value) and a transparent-comparator call. Expect within a small factor.
-* **Hashed `find` is currently slower** than `std::unordered_map` — v1
-  materialises the key on lookup (no heterogeneous hashing yet), so
-  `find("literal")` constructs a `std::string`. This is the first thing to fix if
-  hashed lookup is your hot path.
-* **`build`** is competitive but does `1 + #indices` allocations/element — a
-  pooling/`pmr` allocator (`mic::pmr` is planned) will move this a lot.
+* **Hashed `find` is transparent** — string keys hash through `string_view`, so
+  `find("literal")` / `find(string_view)` does no key materialisation; expect it
+  near `std::unordered_map`. (A non-transparent *user-supplied* hasher falls back
+  to materialising the key.)
+* **`build`** does `1 + #indices` allocations/element. With the default allocator
+  it's competitive with a hand-rolled std composition; with
+  `mic::pmr::multi_index_container` + a `monotonic_buffer_resource` it is roughly
+  **1.5–1.7× faster** (one arena serves every node and index structure).
 * **Iterate** is a linked-structure walk (node-based), so it's pointer-chasing,
   not contiguous — a `storage::flat` policy (planned) would help cache locality.
 * **Ranked `nth`/`rank` are O(n)** in v1 (documented) — don't benchmark them as

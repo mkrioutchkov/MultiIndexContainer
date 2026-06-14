@@ -264,6 +264,36 @@ void test_modify_preserves_iterators() {
     CHECK(t.get<"by_email">().find("a@x")->salary == 50);
 }
 
+// ---------------------------------------------------------------------------
+struct counting_resource : std::pmr::memory_resource {
+    std::size_t allocs = 0;
+    std::pmr::memory_resource* up = std::pmr::new_delete_resource();
+    void* do_allocate(std::size_t b, std::size_t a) override { ++allocs; return up->allocate(b, a); }
+    void do_deallocate(void* p, std::size_t b, std::size_t a) override { up->deallocate(p, b, a); }
+    bool do_is_equal(const std::pmr::memory_resource& o) const noexcept override { return this == &o; }
+};
+
+void test_pmr() {
+    std::println("[test] pmr: every allocation flows through one memory_resource");
+    counting_resource res;
+    using Table = mic::pmr::multi_index_container<Employee,
+        mic::indexed_by<
+            mic::ordered_unique<"by_id",    mic::key<&Employee::id>>,
+            mic::hashed_unique <"by_email", mic::key<&Employee::email>>
+        >>;
+    {
+        Table t(&res);
+        CHECK(t.get_allocator().resource() == &res);
+        for (int i = 0; i < 200; ++i)
+            t.insert(Employee{static_cast<std::uint64_t>(i), "n", "e" + std::to_string(i), i});
+        CHECK(t.size() == 200);
+        CHECK(t.get<"by_id">().find(123)->email == "e123");
+        CHECK(t.get<"by_email">().find("e7")->id == 7);
+        // node + 2 index nodes + registry node per element, all via res -> well over 200 allocs
+        CHECK(res.allocs > 200);
+    }   // all returned to the resource on destruction (no leak via new_delete upstream)
+}
+
 } // namespace
 
 int main() {
@@ -275,6 +305,7 @@ int main() {
     test_expected_and_ranges();
     test_const_element_mode();
     test_modify_preserves_iterators();
+    test_pmr();
 
     std::println("\n{}/{} checks passed", g_checks - g_fail, g_checks);
     return g_fail == 0 ? 0 : 1;

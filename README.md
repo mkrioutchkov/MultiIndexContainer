@@ -53,6 +53,13 @@ for (const Employee& e : s.get<"by_salary">() | std::views::reverse) { /* high�
   element in another index.
 * **`modify` / `replace`** with **rollback-and-keep** semantics, plus
   **node-handle** `extract` / `insert` for zero-copy re-keying, and `merge`.
+* **Transparent hashed lookup** — `get<"by_email">().find("literal")` /
+  `find(string_view)` hashes through `string_view` with **zero key
+  materialisation** (string keys are transparent by default).
+* **`std::pmr` support** — `mic::pmr::multi_index_container<...>` routes *every*
+  allocation (element nodes **and** all per-index structures) through one
+  `std::pmr::memory_resource`, so a pool / `monotonic_buffer_resource` serves the
+  whole container.
 * **Modern API** — `std::expected`-returning `try_insert`, `std::ranges`-ready
   index views (compose `views::filter` / `reverse` / `take`), `std::format`
   support, and `std::from_range` construction.
@@ -129,16 +136,17 @@ Known limitations, slated for later work:
 
 * **Ranked indices**: `rank()` / `nth()` are O(n) in v1 (a sorted std::set
   backs them); an order-statistics tree for O(log n) is planned.
-* **Hashed lookup** materialises the key (no heterogeneous/transparent hashing
-  yet); ordered lookup *is* transparent and zero-materialisation.
 * **One tag per index** (Boost allows multiple); **stateless,
   default-constructible** comparators/hashers/extractors are assumed.
 * **`modify()`** repositions only the indices whose key actually changed, so
   iterators into *unchanged* indices stay valid (as in Boost). The one
   unsupported combination is changing a **hashed** index's key on a
   **pointer-stored** element via `modify()` — use value storage or `replace()`.
-* Not yet implemented: serialization, `std::pmr` allocator plumbing for the
-  index structures, the concurrent variants, and coroutine query helpers.
+* Each element still uses `1 + (#keyed indices)` allocations (node-based, not
+  single-allocation intrusive) — `mic::pmr::multi_index_container` makes that
+  cheap by pooling, but a flat/intrusive storage policy is still future work.
+* Not yet implemented: serialization, the concurrent variants, and coroutine
+  query helpers.
 
 Internally each element lives in one stable node threaded into every index, so
 iterators, pointers and references stay valid until the element is erased.

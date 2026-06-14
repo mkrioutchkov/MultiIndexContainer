@@ -31,6 +31,7 @@
 #include <tuple>
 #include <array>
 #include <memory>
+#include <memory_resource>
 #include <functional>
 #include <utility>
 #include <type_traits>
@@ -194,6 +195,7 @@ struct composite_less {
 };
 
 struct composite_hash {
+    using is_transparent = void;
     template <class X> static std::size_t hash_one(const X& x) {
         return std::hash<std::remove_cvref_t<X>>{}(x);
     }
@@ -213,6 +215,21 @@ struct composite_equal {
     template <class A, class B> bool operator()(const A& a, const B& b) const { return a == b; }
 };
 
+// Transparent default hashers, so a hashed-index lookup never materialises the
+// key. For strings, hashing through string_view is standard-mandated to agree
+// with std::hash<std::string>, so find("literal") / find(string_view) are
+// zero-allocation. For other key types, a transparent wrapper over std::hash
+// still lets a same-typed key be looked up without a copy.
+struct string_hash {
+    using is_transparent = void;
+    std::size_t operator()(std::string_view s) const noexcept { return std::hash<std::string_view>{}(s); }
+};
+template <class Key>
+struct scalar_hash {
+    using is_transparent = void;
+    std::size_t operator()(const Key& k) const noexcept(noexcept(std::hash<Key>{}(k))) { return std::hash<Key>{}(k); }
+};
+
 // ---------------------------------------------------------------------------
 //  Index specifications
 // ---------------------------------------------------------------------------
@@ -223,9 +240,11 @@ template <class E> using ekey = std::remove_cvref_t<typename E::result_type>;
 template <class E> using default_ordered_compare =
     std::conditional_t<is_tuple<ekey<E>>::value, composite_less, std::less<>>;
 template <class E> using default_hash =
-    std::conditional_t<is_tuple<ekey<E>>::value, composite_hash, std::hash<ekey<E>>>;
+    std::conditional_t<is_tuple<ekey<E>>::value, composite_hash,
+        std::conditional_t<std::is_same_v<ekey<E>, std::string> || std::is_same_v<ekey<E>, std::string_view>,
+            string_hash, scalar_hash<ekey<E>>>>;
 template <class E> using default_equal =
-    std::conditional_t<is_tuple<ekey<E>>::value, composite_equal, std::equal_to<ekey<E>>>;
+    std::conditional_t<is_tuple<ekey<E>>::value, composite_equal, std::equal_to<>>;
 } // namespace detail
 
 template <fixed_string Tag, class Extractor, class Compare = detail::default_ordered_compare<Extractor>>
@@ -316,10 +335,11 @@ struct indexed_by {
 // ---------------------------------------------------------------------------
 namespace detail {
 
-template <class NodePtr, class Extractor, class Compare, bool Unique>
+template <class NodePtr, class Extractor, class Compare, bool Unique, class Alloc>
 struct ordered_core {
     static constexpr index_kind kind = index_kind::ordered;
-    using key_type = std::remove_cvref_t<typename Extractor::result_type>;
+    using key_type  = std::remove_cvref_t<typename Extractor::result_type>;
+    using ptr_alloc = typename std::allocator_traits<Alloc>::template rebind_alloc<NodePtr>;
 
     template <class T> static decltype(auto) keyof(const T& t) {
         if constexpr (std::is_same_v<std::remove_cvref_t<T>, NodePtr>) return Extractor{}((*t).value);
@@ -336,9 +356,11 @@ struct ordered_core {
         }
     };
     using container = std::conditional_t<Unique,
-        std::set<NodePtr, node_compare>, std::multiset<NodePtr, node_compare>>;
+        std::set<NodePtr, node_compare, ptr_alloc>, std::multiset<NodePtr, node_compare, ptr_alloc>>;
     using hook_type = typename container::iterator;
-    container c{};
+    container c;
+    ordered_core() = default;
+    explicit ordered_core(const Alloc& a) : c(node_compare{}, ptr_alloc(a)) {}
 
     bool try_insert(NodePtr p, hook_type& out, NodePtr& conflict) {
         if constexpr (Unique) {
@@ -352,10 +374,11 @@ struct ordered_core {
     void remove(NodePtr p, hook_type& h) { (void)p; c.erase(h); }
 };
 
-template <class NodePtr, class Extractor, class Hash, class Eq, bool Unique>
+template <class NodePtr, class Extractor, class Hash, class Eq, bool Unique, class Alloc>
 struct hashed_core {
     static constexpr index_kind kind = index_kind::hashed;
-    using key_type = std::remove_cvref_t<typename Extractor::result_type>;
+    using key_type  = std::remove_cvref_t<typename Extractor::result_type>;
+    using ptr_alloc = typename std::allocator_traits<Alloc>::template rebind_alloc<NodePtr>;
 
     template <class T> static decltype(auto) keyof(const T& t) {
         if constexpr (std::is_same_v<std::remove_cvref_t<T>, NodePtr>) return Extractor{}((*t).value);
@@ -374,10 +397,12 @@ struct hashed_core {
         }
     };
     using container = std::conditional_t<Unique,
-        std::unordered_set<NodePtr, node_hash, node_eq>,
-        std::unordered_multiset<NodePtr, node_hash, node_eq>>;
+        std::unordered_set<NodePtr, node_hash, node_eq, ptr_alloc>,
+        std::unordered_multiset<NodePtr, node_hash, node_eq, ptr_alloc>>;
     using hook_type = typename container::iterator;
-    container c{};
+    container c;
+    hashed_core() = default;
+    explicit hashed_core(const Alloc& a) : c(ptr_alloc(a)) {}
 
     bool try_insert(NodePtr p, hook_type& out, NodePtr& conflict) {
         if constexpr (Unique) {
@@ -391,22 +416,28 @@ struct hashed_core {
     void remove(NodePtr p, hook_type& h) { (void)p; c.erase(h); }
 };
 
-template <class NodePtr>
+template <class NodePtr, class Alloc>
 struct seq_core {
     static constexpr index_kind kind = index_kind::sequenced;
-    using container = std::list<NodePtr>;
+    using ptr_alloc = typename std::allocator_traits<Alloc>::template rebind_alloc<NodePtr>;
+    using container = std::list<NodePtr, ptr_alloc>;
     using hook_type = typename container::iterator;
-    container c{};
+    container c;
+    seq_core() = default;
+    explicit seq_core(const Alloc& a) : c(ptr_alloc(a)) {}
     bool try_insert(NodePtr p, hook_type& out, NodePtr&) { c.push_back(p); out = std::prev(c.end()); return true; }
     void remove(NodePtr, hook_type& h) { c.erase(h); }
 };
 
-template <class NodePtr>
+template <class NodePtr, class Alloc>
 struct rand_core {
     static constexpr index_kind kind = index_kind::random_access;
-    using container = std::vector<NodePtr>;
+    using ptr_alloc = typename std::allocator_traits<Alloc>::template rebind_alloc<NodePtr>;
+    using container = std::vector<NodePtr, ptr_alloc>;
     using hook_type = std::monostate;
-    container c{};
+    container c;
+    rand_core() = default;
+    explicit rand_core(const Alloc& a) : c(ptr_alloc(a)) {}
     bool try_insert(NodePtr p, hook_type&, NodePtr&) { c.push_back(p); return true; }
     void remove(NodePtr p, hook_type&) {
         auto it = std::find(c.begin(), c.end(), p);
@@ -415,23 +446,23 @@ struct rand_core {
 };
 
 // map a spec to its core type
-template <class Spec, class NodePtr> struct core_for;
-template <fixed_string T, class E, class C, class NP>
-struct core_for<ordered_unique<T, E, C>, NP> { using type = ordered_core<NP, E, C, true>; };
-template <fixed_string T, class E, class C, class NP>
-struct core_for<ordered_non_unique<T, E, C>, NP> { using type = ordered_core<NP, E, C, false>; };
-template <fixed_string T, class E, class C, class NP>
-struct core_for<ranked_unique<T, E, C>, NP> { using type = ordered_core<NP, E, C, true>; };
-template <fixed_string T, class E, class C, class NP>
-struct core_for<ranked_non_unique<T, E, C>, NP> { using type = ordered_core<NP, E, C, false>; };
-template <fixed_string T, class E, class H, class Q, class NP>
-struct core_for<hashed_unique<T, E, H, Q>, NP> { using type = hashed_core<NP, E, H, Q, true>; };
-template <fixed_string T, class E, class H, class Q, class NP>
-struct core_for<hashed_non_unique<T, E, H, Q>, NP> { using type = hashed_core<NP, E, H, Q, false>; };
-template <fixed_string T, class NP>
-struct core_for<sequenced<T>, NP> { using type = seq_core<NP>; };
-template <fixed_string T, class NP>
-struct core_for<random_access<T>, NP> { using type = rand_core<NP>; };
+template <class Spec, class NodePtr, class Alloc> struct core_for;
+template <fixed_string T, class E, class C, class NP, class A>
+struct core_for<ordered_unique<T, E, C>, NP, A> { using type = ordered_core<NP, E, C, true, A>; };
+template <fixed_string T, class E, class C, class NP, class A>
+struct core_for<ordered_non_unique<T, E, C>, NP, A> { using type = ordered_core<NP, E, C, false, A>; };
+template <fixed_string T, class E, class C, class NP, class A>
+struct core_for<ranked_unique<T, E, C>, NP, A> { using type = ordered_core<NP, E, C, true, A>; };
+template <fixed_string T, class E, class C, class NP, class A>
+struct core_for<ranked_non_unique<T, E, C>, NP, A> { using type = ordered_core<NP, E, C, false, A>; };
+template <fixed_string T, class E, class H, class Q, class NP, class A>
+struct core_for<hashed_unique<T, E, H, Q>, NP, A> { using type = hashed_core<NP, E, H, Q, true, A>; };
+template <fixed_string T, class E, class H, class Q, class NP, class A>
+struct core_for<hashed_non_unique<T, E, H, Q>, NP, A> { using type = hashed_core<NP, E, H, Q, false, A>; };
+template <fixed_string T, class NP, class A>
+struct core_for<sequenced<T>, NP, A> { using type = seq_core<NP, A>; };
+template <fixed_string T, class NP, class A>
+struct core_for<random_access<T>, NP, A> { using type = rand_core<NP, A>; };
 
 template <class C, class = void> struct core_key { using type = void; };
 template <class C> struct core_key<C, std::void_t<typename C::key_type>> { using type = typename C::key_type; };
@@ -491,7 +522,7 @@ private:
     using elem_value = detail::pointee_t<Value>;
 
     struct node;
-    template <std::size_t I> using core_at = typename detail::core_for<spec_at<I>, node*>::type;
+    template <std::size_t I> using core_at = typename detail::core_for<spec_at<I>, node*, Alloc>::type;
 
     template <class Seq> struct hooks_t;
     template <std::size_t... I> struct hooks_t<std::index_sequence<I...>> {
@@ -505,15 +536,17 @@ private:
     };
     using cores_tuple = typename cores_t<std::make_index_sequence<N>>::type;
 
+    using node_alloc     = typename std::allocator_traits<Alloc>::template rebind_alloc<node>;
+    using registry_alloc = typename std::allocator_traits<Alloc>::template rebind_alloc<node*>;
+    using registry_list  = std::list<node*, registry_alloc>;
+
     struct node {
         Value     value;
         hook_tuple hooks{};
-        typename std::list<node*>::iterator self{};
+        typename registry_list::iterator self{};
         template <class... A>
         explicit node(A&&... a) : value(std::forward<A>(a)...) {}
     };
-
-    using node_alloc = typename std::allocator_traits<Alloc>::template rebind_alloc<node>;
 
     // v1 supports stateless, default-constructible extractors/comparators/hashers
     // only (they are invoked as Extractor{} / Compare{} / Hash{}). Reject anything
@@ -534,10 +567,16 @@ private:
     static constexpr bool checked_ =
         []<std::size_t... I>(std::index_sequence<I...>) { return (check_index<I>() && ...); }(std::make_index_sequence<N>{});
 
-    MIC_NO_UNIQUE_ADDRESS node_alloc nalloc_{};
-    std::list<node*> registry_{};
-    cores_tuple      cores_{};
-    std::size_t      size_{0};
+    MIC_NO_UNIQUE_ADDRESS Alloc      alloc_{};
+    MIC_NO_UNIQUE_ADDRESS node_alloc nalloc_{ alloc_ };
+    registry_list registry_{ registry_alloc(alloc_) };
+    cores_tuple   cores_{ make_cores(alloc_, std::make_index_sequence<N>{}) };
+    std::size_t   size_{0};
+
+    template <std::size_t... I>
+    static cores_tuple make_cores(const Alloc& a, std::index_sequence<I...>) {
+        return cores_tuple{ core_at<I>(a)... };
+    }
 
     template <class... A> node* make_node(A&&... a) {
         node* p = std::allocator_traits<node_alloc>::allocate(nalloc_, 1);
@@ -829,14 +868,24 @@ public:
             return { iterator{ pr.first }, iterator{ pr.second } };
         }
 
-        // ---- hashed lookups (key materialised to key_t) ----
-        template <class K = lookup_key_t> iterator find(const K& k) const requires (kind == index_kind::hashed) { key_t kk(k); return iterator{ core().c.find(kk) }; }
-        template <class K = lookup_key_t> std::size_t count(const K& k) const requires (kind == index_kind::hashed) { key_t kk(k); return core().c.count(kk); }
-        template <class K = lookup_key_t> bool contains(const K& k) const requires (kind == index_kind::hashed) { key_t kk(k); return core().c.find(kk) != core().c.end(); }
+        // ---- hashed lookups (transparent: no key materialisation when possible) ----
+        template <class K = lookup_key_t> iterator find(const K& k) const requires (kind == index_kind::hashed) {
+            auto& c = core().c;
+            if constexpr (requires { c.find(k); }) return iterator{ c.find(k) };
+            else { key_t kk(k); return iterator{ c.find(kk) }; }
+        }
+        template <class K = lookup_key_t> std::size_t count(const K& k) const requires (kind == index_kind::hashed) {
+            auto& c = core().c;
+            if constexpr (requires { c.count(k); }) return c.count(k);
+            else { key_t kk(k); return c.count(kk); }
+        }
+        template <class K = lookup_key_t> bool contains(const K& k) const requires (kind == index_kind::hashed) {
+            return find(k) != end();
+        }
         template <class K = lookup_key_t> std::pair<iterator, iterator> equal_range(const K& k) const requires (kind == index_kind::hashed) {
-            key_t kk(k);
-            auto pr = core().c.equal_range(kk);
-            return { iterator{ pr.first }, iterator{ pr.second } };
+            auto& c = core().c;
+            if constexpr (requires { c.equal_range(k); }) { auto pr = c.equal_range(k); return { iterator{ pr.first }, iterator{ pr.second } }; }
+            else { key_t kk(k); auto pr = c.equal_range(kk); return { iterator{ pr.first }, iterator{ pr.second } }; }
         }
         std::size_t bucket_count() const requires (kind == index_kind::hashed) { return core().c.bucket_count(); }
         float load_factor() const requires (kind == index_kind::hashed) { return core().c.load_factor(); }
@@ -845,12 +894,13 @@ public:
         template <class K = lookup_key_t>
         std::size_t erase_key(const K& k) const requires (kind == index_kind::ordered || kind == index_kind::hashed) {
             std::vector<node*> victims;
-            if constexpr (kind == index_kind::hashed) {
+            auto& c = core().c;
+            if constexpr (kind == index_kind::hashed && !requires { c.equal_range(k); }) {
                 key_t kk(k);
-                auto pr = core().c.equal_range(kk);
+                auto pr = c.equal_range(kk);
                 for (auto it = pr.first; it != pr.second; ++it) victims.push_back(*it);
             } else {
-                auto pr = core().c.equal_range(k);
+                auto pr = c.equal_range(k);
                 for (auto it = pr.first; it != pr.second; ++it) victims.push_back(*it);
             }
             for (node* p : victims) c_->erase_node_full(p);
@@ -934,11 +984,13 @@ public:
 
     // ---- ctors ------------------------------------------------------------
     multi_index_container() = default;
-    explicit multi_index_container(const Alloc& a) : nalloc_(a) {}
+    explicit multi_index_container(const Alloc& a) : alloc_(a) {}   // nalloc_/registry_/cores_ cascade from alloc_
 
-    multi_index_container(const multi_index_container& o) { copy_from(o); }
+    multi_index_container(const multi_index_container& o)
+        : alloc_(std::allocator_traits<Alloc>::select_on_container_copy_construction(o.alloc_)) { copy_from(o); }
+    multi_index_container(const multi_index_container& o, const Alloc& a) : alloc_(a) { copy_from(o); }
     multi_index_container(multi_index_container&& o) noexcept
-        : nalloc_(std::move(o.nalloc_)), registry_(std::move(o.registry_)),
+        : alloc_(std::move(o.alloc_)), nalloc_(std::move(o.nalloc_)), registry_(std::move(o.registry_)),
           cores_(std::move(o.cores_)), size_(o.size_) { o.size_ = 0; }
     multi_index_container& operator=(const multi_index_container& o) {
         if (this != &o) { clear(); copy_from(o); }
@@ -947,7 +999,7 @@ public:
     multi_index_container& operator=(multi_index_container&& o) noexcept {
         if (this != &o) {
             clear();
-            nalloc_ = std::move(o.nalloc_); registry_ = std::move(o.registry_);
+            alloc_ = std::move(o.alloc_); nalloc_ = std::move(o.nalloc_); registry_ = std::move(o.registry_);
             cores_ = std::move(o.cores_); size_ = o.size_; o.size_ = 0;
         }
         return *this;
@@ -955,11 +1007,13 @@ public:
     ~multi_index_container() { clear(); }
 
     template <std::input_iterator It>
-    multi_index_container(It first, It last) { for (; first != last; ++first) insert(*first); }
-    multi_index_container(std::initializer_list<Value> il) { for (const auto& v : il) insert(v); }
+    multi_index_container(It first, It last, const Alloc& a = Alloc{}) : alloc_(a) { for (; first != last; ++first) insert(*first); }
+    multi_index_container(std::initializer_list<Value> il, const Alloc& a = Alloc{}) : alloc_(a) { for (const auto& v : il) insert(v); }
     template <std::ranges::input_range R>
         requires std::constructible_from<Value, std::ranges::range_reference_t<R>>
-    multi_index_container(std::from_range_t, R&& r) { for (auto&& v : r) emplace(std::forward<decltype(v)>(v)); }
+    multi_index_container(std::from_range_t, R&& r, const Alloc& a = Alloc{}) : alloc_(a) { for (auto&& v : r) emplace(std::forward<decltype(v)>(v)); }
+
+    Alloc get_allocator() const noexcept { return alloc_; }
 
     // ---- capacity ---------------------------------------------------------
     std::size_t size()  const noexcept { return size_; }
@@ -972,7 +1026,7 @@ public:
     }
     void swap(multi_index_container& o) noexcept {
         using std::swap;
-        swap(nalloc_, o.nalloc_); swap(registry_, o.registry_);
+        swap(alloc_, o.alloc_);   swap(nalloc_, o.nalloc_); swap(registry_, o.registry_);
         swap(cores_, o.cores_);   swap(size_, o.size_);
     }
     friend void swap(multi_index_container& a, multi_index_container& b) noexcept { a.swap(b); }
@@ -1082,6 +1136,15 @@ void swap(multi_index_container<V, I, A, P>& a, multi_index_container<V, I, A, P
 // as a const pointee view (keys can only change via modify()/replace()).
 template <class Value, class IndexedBy, class Alloc = std::allocator<Value>>
 using const_element_container = multi_index_container<Value, IndexedBy, Alloc, const_element_policy>;
+
+// std::pmr support: every allocation (element nodes AND the per-index structures)
+// flows through one std::pmr::memory_resource, so a pool / monotonic_buffer
+// resource serves the whole container. Construct with a memory_resource*.
+namespace pmr {
+template <class Value, class IndexedBy, class Policy = ::mic::standard_policy>
+using multi_index_container =
+    ::mic::multi_index_container<Value, IndexedBy, std::pmr::polymorphic_allocator<Value>, Policy>;
+}
 
 } // namespace mic
 

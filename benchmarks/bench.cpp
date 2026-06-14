@@ -28,6 +28,7 @@
 #include <cstdlib>
 #include <deque>
 #include <map>
+#include <memory_resource>
 #include <random>
 #include <string>
 #include <unordered_map>
@@ -51,12 +52,13 @@ struct Record {
 };
 
 // ---- mic container ---------------------------------------------------------
-using MicTable = mic::multi_index_container<Record,
-    mic::indexed_by<
+using MicIndices = mic::indexed_by<
         mic::ordered_unique     <"by_id",    mic::key<&Record::id>>,
         mic::ordered_non_unique <"by_name",  mic::key<&Record::name>>,
         mic::hashed_unique      <"by_email", mic::key<&Record::email>>
-    >>;
+    >;
+using MicTable    = mic::multi_index_container<Record, MicIndices>;
+using PmrMicTable = mic::pmr::multi_index_container<Record, MicIndices>;
 
 // ---- hand-rolled std composition (the thing you'd write without a lib) ------
 struct StdTable {
@@ -171,6 +173,15 @@ void run(std::size_t n) {
     row("find(id)",   mic_findid, std_findid, boost_findid, n);
     row("find(email)",mic_findem, std_findem, boost_findem, n);
     row("iterate",    mic_iter,   std_iter,   boost_iter,   n);
+
+    // mic with a pooling allocator: all node/index allocations come from one arena.
+    double mic_pmr_build = best_ns([&] {
+        std::pmr::monotonic_buffer_resource res(std::size_t{1} << 20);
+        PmrMicTable t(&res);
+        for (auto& r : data) t.insert(r);
+    }, 3);
+    std::printf("  %-12s  %10.1f   (mic + monotonic_buffer_resource; x%.2f vs mic default alloc)\n",
+                "build(pmr)", mic_pmr_build / static_cast<double>(n), mic_build / mic_pmr_build);
 }
 
 } // namespace
