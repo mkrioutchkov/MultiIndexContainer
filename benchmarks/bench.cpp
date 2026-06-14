@@ -182,6 +182,14 @@ void run(std::size_t n) {
     }, 3);
     std::printf("  %-12s  %10.1f   (mic + monotonic_buffer_resource; x%.2f vs mic default alloc)\n",
                 "build(pmr)", mic_pmr_build / static_cast<double>(n), mic_build / mic_pmr_build);
+
+    // ranked order-statistics: nth()/rank() are O(log n) (were O(n)).
+    using RankTable = mic::multi_index_container<Record,
+        mic::indexed_by<mic::ranked_non_unique<"by_payload", mic::key<&Record::payload>>>>;
+    RankTable rt; for (auto& r : data) rt.insert(r);
+    auto rix = rt.get<"by_payload">();
+    double nth_ns = best_ns([&] { std::int64_t s = 0; for (std::size_t i = 0; i < n; ++i) s += rix.nth(i)->payload; g_sink += s; }, rd_reps);
+    std::printf("  %-12s  %10.1f   (ranked nth(); O(log n) order-statistic select)\n", "nth", nth_ns / static_cast<double>(n));
 }
 
 } // namespace

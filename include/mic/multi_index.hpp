@@ -338,37 +338,53 @@ namespace detail {
 template <class NodePtr, class Extractor, class Compare, bool Unique, class Alloc>
 struct ordered_core {
     static constexpr index_kind kind = index_kind::ordered;
-    using key_type  = std::remove_cvref_t<typename Extractor::result_type>;
-    using ptr_alloc = typename std::allocator_traits<Alloc>::template rebind_alloc<NodePtr>;
+    using key_type = std::remove_cvref_t<typename Extractor::result_type>;
 
-    template <class T> static decltype(auto) keyof(const T& t) {
-        if constexpr (std::is_same_v<std::remove_cvref_t<T>, NodePtr>) return Extractor{}((*t).value);
-        else return (t);
-    }
     template <class V> static key_type extract_key(const V& v) { return Extractor{}(v); }
     static bool keys_equal(const key_type& a, const key_type& b) {
         return !Compare{}(a, b) && !Compare{}(b, a);
     }
+
+    // For a small, trivially-copyable key (e.g. an int id) we store the key INLINE
+    // beside the node pointer, so a comparison reads the key directly instead of
+    // chasing node* -> node -> value -> key. For string/large keys we keep just
+    // the pointer (no memory regression; comparison cost dominates the indirection).
+    static constexpr bool inline_key =
+        std::is_trivially_copyable_v<key_type> && std::is_default_constructible_v<key_type> && sizeof(key_type) <= 16;
+    struct entry { key_type key; NodePtr p; };
+    using stored = std::conditional_t<inline_key, entry, NodePtr>;
+    static NodePtr node_of(const stored& s) { if constexpr (inline_key) return s.p; else return s; }
+
     struct node_compare {
         using is_transparent = void;
+        template <class T> static decltype(auto) kof(const T& t) {
+            if constexpr (std::is_same_v<std::remove_cvref_t<T>, NodePtr>) return Extractor{}((*t).value);
+            else if constexpr (std::is_same_v<std::remove_cvref_t<T>, entry>) return (t.key);
+            else return (t);   // bare lookup key
+        }
         template <class A, class B> bool operator()(const A& a, const B& b) const {
-            return Compare{}(keyof(a), keyof(b));
+            return Compare{}(kof(a), kof(b));
         }
     };
+    using ptr_alloc = typename std::allocator_traits<Alloc>::template rebind_alloc<stored>;
     using container = std::conditional_t<Unique,
-        std::set<NodePtr, node_compare, ptr_alloc>, std::multiset<NodePtr, node_compare, ptr_alloc>>;
+        std::set<stored, node_compare, ptr_alloc>, std::multiset<stored, node_compare, ptr_alloc>>;
     using hook_type = typename container::iterator;
     container c;
     ordered_core() = default;
     explicit ordered_core(const Alloc& a) : c(node_compare{}, ptr_alloc(a)) {}
 
+    static stored make_stored(NodePtr p) {
+        if constexpr (inline_key) return entry{ Extractor{}((*p).value), p };
+        else return p;
+    }
     bool try_insert(NodePtr p, hook_type& out, NodePtr& conflict) {
         if constexpr (Unique) {
-            auto [it, ok] = c.insert(p);
-            if (!ok) { conflict = *it; return false; }
+            auto [it, ok] = c.insert(make_stored(p));
+            if (!ok) { conflict = node_of(*it); return false; }
             out = it; return true;
         } else {
-            out = c.insert(p); return true;
+            out = c.insert(make_stored(p)); return true;
         }
     }
     void remove(NodePtr p, hook_type& h) { (void)p; c.erase(h); }
@@ -445,6 +461,191 @@ struct rand_core {
     }
 };
 
+// ---------------------------------------------------------------------------
+//  Order-statistics tree (a size-augmented treap) backing ranked indices.
+//  Gives O(log n) nth()/rank() in addition to the ordered lookup surface.
+//  Expected O(log n) per operation (randomised priorities). Stores NodePtr,
+//  ordered by Compare (a transparent comparator over NodePtr / lookup keys).
+// ---------------------------------------------------------------------------
+template <class NodePtr, class Compare, class Alloc, bool Unique>
+class ranked_tree {
+    struct tnode {
+        NodePtr value{};
+        tnode* l = nullptr; tnode* r = nullptr; tnode* up = nullptr;
+        std::size_t sz = 1; std::uint32_t prio = 0;
+    };
+    using talloc = typename std::allocator_traits<Alloc>::template rebind_alloc<tnode>;
+    [[no_unique_address]] talloc al_{};
+    tnode* root_ = nullptr;
+    std::size_t n_ = 0;
+    std::uint32_t rng_ = 2463534242u;
+
+    std::uint32_t rand_prio() { std::uint32_t x = rng_; x ^= x << 13; x ^= x >> 17; x ^= x << 5; rng_ = x; return x; }
+    static std::size_t S(tnode* t) { return t ? t->sz : 0; }
+    static void upd(tnode* t) { if (t) t->sz = 1 + S(t->l) + S(t->r); }
+    static tnode* leftmost(tnode* t)  { if (!t) return nullptr; while (t->l) t = t->l; return t; }
+    static tnode* rightmost(tnode* t) { if (!t) return nullptr; while (t->r) t = t->r; return t; }
+    static tnode* succ(tnode* t) { if (t->r) return leftmost(t->r); while (t->up && t == t->up->r) t = t->up; return t->up; }
+    static tnode* pred(tnode* t) { if (t->l) return rightmost(t->l); while (t->up && t == t->up->l) t = t->up; return t->up; }
+
+    tnode* make(NodePtr v) {
+        tnode* t = std::allocator_traits<talloc>::allocate(al_, 1);
+        std::allocator_traits<talloc>::construct(al_, t);
+        t->value = v; t->prio = rand_prio();
+        return t;
+    }
+    void dispose(tnode* t) { std::allocator_traits<talloc>::destroy(al_, t); std::allocator_traits<talloc>::deallocate(al_, t, 1); }
+    void destroy_subtree(tnode* t) { if (!t) return; destroy_subtree(t->l); destroy_subtree(t->r); dispose(t); }
+
+    void rot_right(tnode* y) {   // y->l rises, y descends right; fixes parent links + sizes
+        tnode* x = y->l; tnode* p = y->up;
+        y->l = x->r; if (x->r) x->r->up = y;
+        x->r = y; y->up = x; x->up = p;
+        if (p) { if (p->l == y) p->l = x; else p->r = x; } else root_ = x;
+        upd(y); upd(x);
+    }
+    void rot_left(tnode* y) {
+        tnode* x = y->r; tnode* p = y->up;
+        y->r = x->l; if (x->l) x->l->up = y;
+        x->l = y; y->up = x; x->up = p;
+        if (p) { if (p->l == y) p->l = x; else p->r = x; } else root_ = x;
+        upd(y); upd(x);
+    }
+    template <class K> tnode* lb(const K& k) const {   // first node whose key is >= k
+        tnode* t = root_; tnode* res = nullptr;
+        while (t) { if (Compare{}(t->value, k)) t = t->r; else { res = t; t = t->l; } }
+        return res;
+    }
+    template <class K> tnode* ub(const K& k) const {   // first node whose key is > k
+        tnode* t = root_; tnode* res = nullptr;
+        while (t) { if (Compare{}(k, t->value)) { res = t; t = t->l; } else t = t->r; }
+        return res;
+    }
+    tnode* insert_node(NodePtr v) {
+        tnode* nn = make(v);
+        if (!root_) { root_ = nn; ++n_; return nn; }
+        tnode* t = root_; tnode* par = nullptr; bool left = false;
+        while (t) { par = t; if (Compare{}(v, t->value)) { left = true; t = t->l; } else { left = false; t = t->r; } }
+        nn->up = par; (left ? par->l : par->r) = nn; ++n_;
+        for (tnode* a = par; a; a = a->up) ++a->sz;                 // account for nn on the path
+        while (nn->up && nn->prio > nn->up->prio) {                 // bubble up by priority (max-heap)
+            if (nn == nn->up->l) rot_right(nn->up); else rot_left(nn->up);
+        }
+        return nn;
+    }
+    void erase_node(tnode* z) {
+        while (z->l || z->r) {                                      // rotate z down to a leaf
+            if (!z->r || (z->l && z->l->prio > z->r->prio)) rot_right(z);
+            else rot_left(z);
+        }
+        tnode* p = z->up;
+        if (p) { if (p->l == z) p->l = nullptr; else p->r = nullptr; } else root_ = nullptr;
+        for (tnode* a = p; a; a = a->up) --a->sz;
+        dispose(z); --n_;
+    }
+
+public:
+    ranked_tree() = default;
+    explicit ranked_tree(const Alloc& a) : al_(a) {}
+    ranked_tree(ranked_tree&& o) noexcept : al_(std::move(o.al_)), root_(o.root_), n_(o.n_), rng_(o.rng_) { o.root_ = nullptr; o.n_ = 0; }
+    ranked_tree& operator=(ranked_tree&& o) noexcept {
+        if (this != &o) { clear(); al_ = std::move(o.al_); root_ = o.root_; n_ = o.n_; rng_ = o.rng_; o.root_ = nullptr; o.n_ = 0; }
+        return *this;
+    }
+    ranked_tree(const ranked_tree&) = delete;            // container copies via rebuild, never copies a core
+    ranked_tree& operator=(const ranked_tree&) = delete;
+    ~ranked_tree() { clear(); }
+
+    void clear() { destroy_subtree(root_); root_ = nullptr; n_ = 0; }
+    void swap(ranked_tree& o) noexcept { using std::swap; swap(al_, o.al_); swap(root_, o.root_); swap(n_, o.n_); swap(rng_, o.rng_); }
+    std::size_t size() const { return n_; }
+    bool empty() const { return n_ == 0; }
+
+    struct iterator {
+        const ranked_tree* tree = nullptr;
+        tnode* cur = nullptr;
+        using value_type        = NodePtr;
+        using reference         = const NodePtr&;
+        using pointer           = const NodePtr*;
+        using difference_type   = std::ptrdiff_t;
+        using iterator_category = std::bidirectional_iterator_tag;
+        using iterator_concept  = std::bidirectional_iterator_tag;
+        iterator() = default;
+        iterator(const ranked_tree* t, tnode* c) : tree(t), cur(c) {}
+        reference operator*()  const { return cur->value; }
+        pointer   operator->() const { return &cur->value; }
+        iterator& operator++() { cur = succ(cur); return *this; }
+        iterator  operator++(int) { auto t = *this; ++*this; return t; }
+        iterator& operator--() { cur = cur ? pred(cur) : rightmost(tree->root_); return *this; }
+        iterator  operator--(int) { auto t = *this; --*this; return t; }
+        bool operator==(const iterator& o) const { return cur == o.cur; }
+        tnode* node() const { return cur; }
+    };
+    using const_iterator = iterator;
+    iterator begin() const { return { this, leftmost(root_) }; }
+    iterator end()   const { return { this, nullptr }; }
+
+    template <class K> iterator lower_bound(const K& k) const { return { this, lb(k) }; }
+    template <class K> iterator upper_bound(const K& k) const { return { this, ub(k) }; }
+    template <class K> iterator find(const K& k) const {
+        tnode* t = lb(k);
+        return (t && !Compare{}(k, t->value)) ? iterator{ this, t } : end();
+    }
+    template <class K> std::pair<iterator, iterator> equal_range(const K& k) const { return { lower_bound(k), upper_bound(k) }; }
+    template <class K> std::size_t count(const K& k) const {
+        std::size_t c = 0; for (auto it = lower_bound(k), e = upper_bound(k); it != e; ++it) ++c; return c;
+    }
+
+    iterator nth(std::size_t k) const {                      // O(log n) select
+        tnode* t = root_;
+        while (t) { std::size_t ls = S(t->l); if (k < ls) t = t->l; else if (k == ls) return { this, t }; else { k -= ls + 1; t = t->r; } }
+        return end();
+    }
+    std::size_t rank(iterator it) const {                    // O(log n) order-of
+        tnode* t = it.cur;
+        if (!t) return n_;
+        std::size_t r = S(t->l);
+        while (t->up) { if (t == t->up->r) r += S(t->up->l) + 1; t = t->up; }
+        return r;
+    }
+
+    bool try_add(NodePtr v, iterator& out, NodePtr& conflict) {
+        if constexpr (Unique) {
+            tnode* e = lb(v);
+            if (e && !Compare{}(v, e->value)) { conflict = e->value; return false; }
+        }
+        out = iterator{ this, insert_node(v) };
+        return true;
+    }
+    void erase(iterator it) { erase_node(it.cur); }
+};
+
+template <class NodePtr, class Extractor, class Compare, bool Unique, class Alloc>
+struct ranked_core {
+    static constexpr index_kind kind = index_kind::ordered;
+    using key_type = std::remove_cvref_t<typename Extractor::result_type>;
+
+    template <class V> static key_type extract_key(const V& v) { return Extractor{}(v); }
+    static bool keys_equal(const key_type& a, const key_type& b) { return !Compare{}(a, b) && !Compare{}(b, a); }
+
+    struct node_compare {
+        using is_transparent = void;
+        template <class T> static decltype(auto) kof(const T& t) {
+            if constexpr (std::is_same_v<std::remove_cvref_t<T>, NodePtr>) return Extractor{}((*t).value);
+            else return (t);
+        }
+        template <class A, class B> bool operator()(const A& a, const B& b) const { return Compare{}(kof(a), kof(b)); }
+    };
+    using container = ranked_tree<NodePtr, node_compare, Alloc, Unique>;
+    using hook_type = typename container::iterator;
+    container c;
+    ranked_core() = default;
+    explicit ranked_core(const Alloc& a) : c(a) {}
+
+    bool try_insert(NodePtr p, hook_type& out, NodePtr& conflict) { return c.try_add(p, out, conflict); }
+    void remove(NodePtr, hook_type& h) { c.erase(h); }
+};
+
 // map a spec to its core type
 template <class Spec, class NodePtr, class Alloc> struct core_for;
 template <fixed_string T, class E, class C, class NP, class A>
@@ -452,9 +653,9 @@ struct core_for<ordered_unique<T, E, C>, NP, A> { using type = ordered_core<NP, 
 template <fixed_string T, class E, class C, class NP, class A>
 struct core_for<ordered_non_unique<T, E, C>, NP, A> { using type = ordered_core<NP, E, C, false, A>; };
 template <fixed_string T, class E, class C, class NP, class A>
-struct core_for<ranked_unique<T, E, C>, NP, A> { using type = ordered_core<NP, E, C, true, A>; };
+struct core_for<ranked_unique<T, E, C>, NP, A> { using type = ranked_core<NP, E, C, true, A>; };
 template <fixed_string T, class E, class C, class NP, class A>
-struct core_for<ranked_non_unique<T, E, C>, NP, A> { using type = ordered_core<NP, E, C, false, A>; };
+struct core_for<ranked_non_unique<T, E, C>, NP, A> { using type = ranked_core<NP, E, C, false, A>; };
 template <fixed_string T, class E, class H, class Q, class NP, class A>
 struct core_for<hashed_unique<T, E, H, Q>, NP, A> { using type = hashed_core<NP, E, H, Q, true, A>; };
 template <fixed_string T, class E, class H, class Q, class NP, class A>
@@ -628,12 +829,14 @@ public:
         explicit index_iterator(It it) : it_(it) {}
 
         reference operator*()  const {
-            if constexpr (kConstElem) return *std::to_address((*it_)->value);
-            else                      return (*it_)->value;
+            node* n = get_node();
+            if constexpr (kConstElem) return *std::to_address(n->value);
+            else                      return n->value;
         }
         pointer   operator->() const {
-            if constexpr (kConstElem) return std::to_address((*it_)->value);
-            else                      return &(*it_)->value;
+            node* n = get_node();
+            if constexpr (kConstElem) return std::to_address(n->value);
+            else                      return &n->value;
         }
 
         index_iterator& operator++() { ++it_; return *this; }
@@ -652,7 +855,11 @@ public:
 
         bool operator==(const index_iterator& o) const { return it_ == o.it_; }
         It    base()     const { return it_; }
-        node* get_node() const { return *it_; }
+        node* get_node() const {
+            decltype(auto) s = *it_;
+            if constexpr (std::is_same_v<std::remove_cvref_t<decltype(s)>, node*>) return s;
+            else return s.p;   // inline entry { key, node* p }
+        }
     };
 
 private:
@@ -898,22 +1105,18 @@ public:
             if constexpr (kind == index_kind::hashed && !requires { c.equal_range(k); }) {
                 key_t kk(k);
                 auto pr = c.equal_range(kk);
-                for (auto it = pr.first; it != pr.second; ++it) victims.push_back(*it);
+                for (auto it = pr.first; it != pr.second; ++it) victims.push_back(iterator{ it }.get_node());
             } else {
                 auto pr = c.equal_range(k);
-                for (auto it = pr.first; it != pr.second; ++it) victims.push_back(*it);
+                for (auto it = pr.first; it != pr.second; ++it) victims.push_back(iterator{ it }.get_node());
             }
             for (node* p : victims) c_->erase_node_full(p);
             return victims.size();
         }
 
-        // ---- ranked extras (O(n) in v1) ----
-        iterator nth(std::size_t n) const requires (ranked) {
-            auto it = core().c.begin(); std::advance(it, static_cast<std::ptrdiff_t>(n)); return iterator{ it };
-        }
-        std::size_t rank(iterator it) const requires (ranked) {
-            return static_cast<std::size_t>(std::distance(core().c.begin(), it.base()));
-        }
+        // ---- ranked extras (O(log n) via the order-statistics tree) ----
+        iterator nth(std::size_t n) const requires (ranked) { return iterator{ core().c.nth(n) }; }
+        std::size_t rank(iterator it) const requires (ranked) { return core().c.rank(it.base()); }
 
         // ---- sequenced ops ----
         const Value& front() const requires (kind == index_kind::sequenced || kind == index_kind::random_access) { return *begin(); }

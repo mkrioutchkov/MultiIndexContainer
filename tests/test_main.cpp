@@ -8,6 +8,8 @@
 #include <algorithm>
 #include <type_traits>
 #include <vector>
+#include <map>
+#include <random>
 
 namespace {
 
@@ -294,6 +296,60 @@ void test_pmr() {
     }   // all returned to the resource on destruction (no leak via new_delete upstream)
 }
 
+void test_ranked_stress() {
+    std::println("[test] ranked order-statistics tree (randomised stress vs oracle)");
+    struct Item { int id; int key; };
+    using T = mic::multi_index_container<Item,
+        mic::indexed_by<
+            mic::ordered_unique   <"by_id",  mic::key<&Item::id>>,
+            mic::ranked_non_unique<"by_key", mic::key<&Item::key>>
+        >>;
+    T t;
+    std::mt19937 rng(2026);
+    std::map<int, int> oracle;   // id -> key
+    int next_id = 0;
+
+    auto verify = [&] {
+        std::vector<int> keys;
+        for (auto& [id, k] : oracle) keys.push_back(k);
+        std::ranges::sort(keys);
+        auto rk = t.get<"by_key">();
+        CHECK(rk.size() == keys.size());
+        std::vector<int> got;
+        for (const Item& it : rk) got.push_back(it.key);
+        CHECK(got == keys);                                   // in-order == sorted
+        bool nth_ok = true;
+        for (std::size_t k = 0; k < keys.size(); ++k)
+            if (rk.nth(k)->key != keys[k]) nth_ok = false;    // O(log n) select correct
+        CHECK(nth_ok);
+        bool rank_ok = true;
+        for (int trial = 0; trial < 8 && !keys.empty(); ++trial) {
+            int x = keys[rng() % keys.size()];
+            auto expect = static_cast<std::size_t>(std::ranges::lower_bound(keys, x) - keys.begin());
+            if (rk.rank(rk.lower_bound(x)) != expect) rank_ok = false;   // O(log n) order-of correct
+        }
+        CHECK(rank_ok);
+    };
+
+    for (int round = 0; round < 600; ++round) {
+        int op = static_cast<int>(rng() % 3);
+        if (op == 0 || oracle.empty()) {
+            int id = next_id++, key = static_cast<int>(rng() % 40);
+            t.insert(Item{id, key}); oracle[id] = key;
+        } else if (op == 1) {
+            auto it = oracle.begin(); std::advance(it, rng() % oracle.size());
+            t.get<"by_id">().erase_key(it->first); oracle.erase(it);
+        } else {
+            auto it = oracle.begin(); std::advance(it, rng() % oracle.size());
+            int nk = static_cast<int>(rng() % 40);
+            t.get<"by_id">().modify(t.get<"by_id">().find(it->first), [&](Item& x) { x.key = nk; });
+            it->second = nk;
+        }
+        if (round % 25 == 0) verify();
+    }
+    verify();
+}
+
 } // namespace
 
 int main() {
@@ -306,6 +362,7 @@ int main() {
     test_const_element_mode();
     test_modify_preserves_iterators();
     test_pmr();
+    test_ranked_stress();
 
     std::println("\n{}/{} checks passed", g_checks - g_fail, g_checks);
     return g_fail == 0 ? 0 : 1;

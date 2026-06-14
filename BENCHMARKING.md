@@ -215,8 +215,10 @@ and pin the process as in §1. Emit `--benchmark_out=results.json` and diff with
 
 So you can sanity-check your results against the implementation:
 
-* **Ordered `find`** ≈ `std::set`/`std::map` find, plus one pointer indirection
-  (node → value) and a transparent-comparator call. Expect within a small factor.
+* **Ordered `find`** ≈ `std::set`/`std::map` find. Small trivially-copyable keys
+  (e.g. `int`) are stored inline in the index node, so the comparison reads the
+  key directly — `find(id)` is at or slightly above `std::map`. String/large keys
+  keep pointer storage (one extra indirection per compare).
 * **Hashed `find` is transparent** — string keys hash through `string_view`, so
   `find("literal")` / `find(string_view)` does no key materialisation; expect it
   near `std::unordered_map`. (A non-transparent *user-supplied* hasher falls back
@@ -227,8 +229,9 @@ So you can sanity-check your results against the implementation:
   **1.5–1.7× faster** (one arena serves every node and index structure).
 * **Iterate** is a linked-structure walk (node-based), so it's pointer-chasing,
   not contiguous — a `storage::flat` policy (planned) would help cache locality.
-* **Ranked `nth`/`rank` are O(n)** in v1 (documented) — don't benchmark them as
-  if they were O(log n); the order-statistics tree is the planned upgrade.
+* **Ranked `nth`/`rank` are O(log n)** — backed by a size-augmented
+  order-statistics tree (a randomised treap), so `nth(k)` stays in the hundreds
+  of nanoseconds even at N = 10⁶ (it should grow log-shaped, not linearly).
 
 If a result contradicts the above, suspect the measurement (Debug build, shared
 vCPU, optimiser deleting the work) before suspecting the library.
