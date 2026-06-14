@@ -45,7 +45,8 @@ for (const Employee& e : s.get<"by_salary">() | std::views::reverse) { /* high�
   * `mic::key<&C::a, &C::b, ...>` — deduces the right extractor from the pointer
 * **Smart-pointer elements** — store `std::shared_ptr<T>` / `std::unique_ptr<T>`
   / raw pointers / `std::reference_wrapper<T>`; extractors transparently
-  dereference to the underlying object.
+  dereference to the underlying object. Opt into `mic::const_element_container`
+  for **key-mutation safety** (see below).
 * **Enforced string-literal tags** — `get<"by_id">()` — *and* Boost-style
   numeric `get<0>()`. Tag typos and unknown indices are compile-time errors.
 * **Projection** — `project<"other_tag">(it)` jumps an iterator to the same
@@ -55,6 +56,26 @@ for (const Employee& e : s.get<"by_salary">() | std::views::reverse) { /* high�
 * **Modern API** — `std::expected`-returning `try_insert`, `std::ranges`-ready
   index views (compose `views::filter` / `reverse` / `take`), `std::format`
   support, and `std::from_range` construction.
+
+## Key safety with pointer elements
+
+A multi-index container only stays correct if **keys change exclusively through
+`modify()` / `replace()`** — those re-thread the element into every index. For
+value-stored elements this is enforced for free: iterators hand out `const T&`,
+so `it->key = x` won't compile.
+
+Pointer elements are the sharp edge (the same one Boost has): a
+`const std::shared_ptr<T>&` still dereferences to a **mutable** `T&`, so
+`it->key = x` compiles and silently corrupts the indices. Two ways to stay safe:
+
+* **`mic::const_element_container<...>`** (opt-in) — for pointer-like elements,
+  iterators expose the pointee as `const T&`. Reads and ranges work; mutating a
+  key through an iterator is a compile error; `modify()` is still the write path
+  (its mutator receives the mutable pointer). Plain `mic::multi_index_container`
+  keeps Boost-style raw access. See [examples/const_elements.cpp](examples/const_elements.cpp).
+* **Keys by value, payload behind a pointer** — keep keys as plain members
+  (const-protected) and put only mutable payload behind a `shared_ptr`; then
+  non-key mutation is free and keys can't be corrupted.
 
 ## Requirements
 

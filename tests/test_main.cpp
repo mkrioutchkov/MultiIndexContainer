@@ -6,6 +6,8 @@
 #include <memory>
 #include <ranges>
 #include <algorithm>
+#include <type_traits>
+#include <vector>
 
 namespace {
 
@@ -208,6 +210,34 @@ void test_expected_and_ranges() {
     std::println("  formatted: {}", t);
 }
 
+// ---------------------------------------------------------------------------
+void test_const_element_mode() {
+    std::println("[test] const_element_container: const pointee through iterators");
+    using Ptr = std::shared_ptr<Employee>;
+    using Table = mic::const_element_container<Ptr,
+        mic::indexed_by<
+            mic::ordered_unique<"by_id", mic::member<Employee, std::uint64_t, &Employee::id>>
+        >>;
+    Table t;
+    t.insert(std::make_shared<Employee>(Employee{1, "A", "a", 10}));
+    t.insert(std::make_shared<Employee>(Employee{2, "B", "b", 20}));
+
+    // iterators expose the pointee as 'const Employee&' (not a mutable shared_ptr)
+    static_assert(std::is_same_v<decltype(*t.get<"by_id">().begin()), const Employee&>);
+
+    auto it = t.get<"by_id">().find(1);
+    CHECK(it->name == "A");                 // reads through -> are const
+
+    // modify() remains the sanctioned write path (lambda still sees Ptr&)
+    bool ok = t.get<"by_id">().modify(it, [](Ptr& p) { p->id = 100; });
+    CHECK(ok);
+    CHECK(t.get<"by_id">().contains(100));
+
+    std::vector<std::uint64_t> ids;
+    for (const Employee& e : t.get<"by_id">()) ids.push_back(e.id);
+    CHECK((ids == std::vector<std::uint64_t>{2, 100}));
+}
+
 } // namespace
 
 int main() {
@@ -217,6 +247,7 @@ int main() {
     test_modify_replace_rollback();
     test_projection_and_nodehandle();
     test_expected_and_ranges();
+    test_const_element_mode();
 
     std::println("\n{}/{} checks passed", g_checks - g_fail, g_checks);
     return g_fail == 0 ? 0 : 1;

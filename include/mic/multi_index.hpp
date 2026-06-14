@@ -442,10 +442,32 @@ struct insert_error {
     std::string_view index_tag;
 };
 
+// ---------------------------------------------------------------------------
+//  Pointer-like detection + element-access policy
+// ---------------------------------------------------------------------------
+namespace detail {
+template <class T>
+concept pointer_like =
+    requires { typename std::pointer_traits<T>::element_type; } &&
+    requires(const T& p) { *p; };
+template <class T, bool = pointer_like<T>> struct pointee { using type = T; };
+template <class T> struct pointee<T, true> { using type = typename std::pointer_traits<T>::element_type; };
+template <class T> using pointee_t = typename pointee<T>::type;
+} // namespace detail
+
+// Element-access policy. With const_element_policy AND a pointer-like Value
+// (T*, std::shared_ptr<T>, std::unique_ptr<T>, ...), index iterators expose a
+// const view of the pointee (const T&) so a key can never be mutated behind the
+// indices' backs through the stored pointer — writes must go through
+// modify()/replace(). It is a no-op for value (non-pointer) elements, which are
+// already const-protected. See const_element_container below.
+struct standard_policy      { static constexpr bool const_elements = false; };
+struct const_element_policy { static constexpr bool const_elements = true;  };
+
 // ===========================================================================
 //  multi_index_container
 // ===========================================================================
-template <class Value, class IndexedBy, class Alloc = std::allocator<Value>>
+template <class Value, class IndexedBy, class Alloc = std::allocator<Value>, class Policy = standard_policy>
 class multi_index_container {
 public:
     using value_type     = Value;
@@ -457,6 +479,10 @@ private:
     static constexpr std::size_t N = std::tuple_size_v<specs_tuple>;
     static_assert(N >= 1, "mic::multi_index_container requires at least one index");
     template <std::size_t I> using spec_at = std::tuple_element_t<I, specs_tuple>;
+
+    // When enabled, iterators present pointer-like elements as a const pointee view.
+    static constexpr bool kConstElem = Policy::const_elements && detail::pointer_like<Value>;
+    using elem_value = detail::pointee_t<Value>;
 
     struct node;
     template <std::size_t I> using core_at = typename detail::core_for<spec_at<I>, node*>::type;
@@ -544,9 +570,9 @@ public:
         It it_{};
     public:
         using under             = It;
-        using value_type        = Value;
-        using reference         = const Value&;
-        using pointer           = const Value*;
+        using value_type        = std::conditional_t<kConstElem, elem_value, Value>;
+        using reference         = std::conditional_t<kConstElem, const elem_value&, const Value&>;
+        using pointer           = std::conditional_t<kConstElem, const elem_value*, const Value*>;
         using difference_type   = std::ptrdiff_t;
         using iterator_category = typename std::iterator_traits<It>::iterator_category;
         using iterator_concept  = std::conditional_t<std::random_access_iterator<It>, std::random_access_iterator_tag,
@@ -556,8 +582,14 @@ public:
         index_iterator() = default;
         explicit index_iterator(It it) : it_(it) {}
 
-        reference operator*()  const { return (*it_)->value; }
-        pointer   operator->() const { return &(*it_)->value; }
+        reference operator*()  const {
+            if constexpr (kConstElem) return *std::to_address((*it_)->value);
+            else                      return (*it_)->value;
+        }
+        pointer   operator->() const {
+            if constexpr (kConstElem) return std::to_address((*it_)->value);
+            else                      return &(*it_)->value;
+        }
 
         index_iterator& operator++() { ++it_; return *this; }
         index_iterator  operator++(int) { auto t = *this; ++it_; return t; }
@@ -989,15 +1021,20 @@ public:
     }
 };
 
-template <class V, class I, class A>
-void swap(multi_index_container<V, I, A>& a, multi_index_container<V, I, A>& b) noexcept { a.swap(b); }
+template <class V, class I, class A, class P>
+void swap(multi_index_container<V, I, A, P>& a, multi_index_container<V, I, A, P>& b) noexcept { a.swap(b); }
+
+// Convenience alias: a container whose iterators present pointer-like elements
+// as a const pointee view (keys can only change via modify()/replace()).
+template <class Value, class IndexedBy, class Alloc = std::allocator<Value>>
+using const_element_container = multi_index_container<Value, IndexedBy, Alloc, const_element_policy>;
 
 } // namespace mic
 
 // ---- std::format summary ---------------------------------------------------
-template <class V, class I, class A>
-struct std::formatter<mic::multi_index_container<V, I, A>> : std::formatter<std::string> {
-    auto format(const mic::multi_index_container<V, I, A>& m, std::format_context& ctx) const {
+template <class V, class I, class A, class P>
+struct std::formatter<mic::multi_index_container<V, I, A, P>> : std::formatter<std::string> {
+    auto format(const mic::multi_index_container<V, I, A, P>& m, std::format_context& ctx) const {
         return std::formatter<std::string>::format(std::format("multi_index(size={})", m.size()), ctx);
     }
 };
