@@ -737,14 +737,13 @@ private:
     };
     using cores_tuple = typename cores_t<std::make_index_sequence<N>>::type;
 
-    using node_alloc     = typename std::allocator_traits<Alloc>::template rebind_alloc<node>;
-    using registry_alloc = typename std::allocator_traits<Alloc>::template rebind_alloc<node*>;
-    using registry_list  = std::list<node*, registry_alloc>;
+    using node_alloc = typename std::allocator_traits<Alloc>::template rebind_alloc<node>;
 
     struct node {
         Value     value;
         hook_tuple hooks{};
-        typename registry_list::iterator self{};
+        node* rprev = nullptr;   // intrusive registry list (every live node, in
+        node* rnext = nullptr;   // insertion order) — no separate allocation
         template <class... A>
         explicit node(A&&... a) : value(std::forward<A>(a)...) {}
     };
@@ -770,13 +769,24 @@ private:
 
     MIC_NO_UNIQUE_ADDRESS Alloc      alloc_{};
     MIC_NO_UNIQUE_ADDRESS node_alloc nalloc_{ alloc_ };
-    registry_list registry_{ registry_alloc(alloc_) };
     cores_tuple   cores_{ make_cores(alloc_, std::make_index_sequence<N>{}) };
+    node* rhead_ = nullptr;          // intrusive registry: head/tail of all live nodes
+    node* rtail_ = nullptr;
     std::size_t   size_{0};
 
     template <std::size_t... I>
     static cores_tuple make_cores(const Alloc& a, std::index_sequence<I...>) {
         return cores_tuple{ core_at<I>(a)... };
+    }
+
+    void reg_push_back(node* p) {
+        p->rprev = rtail_; p->rnext = nullptr;
+        (rtail_ ? rtail_->rnext : rhead_) = p;
+        rtail_ = p;
+    }
+    void reg_unlink(node* p) {
+        (p->rprev ? p->rprev->rnext : rhead_) = p->rnext;
+        (p->rnext ? p->rnext->rprev : rtail_) = p->rprev;
     }
 
     template <class... A> node* make_node(A&&... a) {
@@ -892,7 +902,7 @@ private:
             destroy_node(p);
             return { it, false };
         }
-        registry_.push_back(p); p->self = std::prev(registry_.end()); ++size_;
+        reg_push_back(p); ++size_;
         return { make_iter<0>(p), true };
     }
 
@@ -986,12 +996,12 @@ private:
         if (insert_changed<0>(p, ch, conflict, failed)) return true;
         p->value = std::move(snapshot);                  // rollback-and-keep (restore OLD keys)
         node* c2 = nullptr; std::size_t f2 = N;
-        if (!insert_changed<0>(p, ch, c2, f2)) { registry_.erase(p->self); destroy_node(p); --size_; }
+        if (!insert_changed<0>(p, ch, c2, f2)) { reg_unlink(p); destroy_node(p); --size_; }
         return false;
     }
     void erase_node_full(node* p) {
         remove_all<0>(p);
-        registry_.erase(p->self);
+        reg_unlink(p);
         destroy_node(p);
         --size_;
     }
@@ -1011,7 +1021,7 @@ private:
     void copy_from(const multi_index_container& o) {
         constexpr std::size_t S = first_sequence_index();
         if constexpr (S < N) { for (node* p : std::get<S>(o.cores_).c) insert(p->value); }
-        else                 { for (node* p : o.registry_) insert(p->value); }
+        else                 { for (node* p = o.rhead_; p; p = p->rnext) insert(p->value); }
     }
 
 public:
@@ -1187,14 +1197,14 @@ public:
 
     // ---- ctors ------------------------------------------------------------
     multi_index_container() = default;
-    explicit multi_index_container(const Alloc& a) : alloc_(a) {}   // nalloc_/registry_/cores_ cascade from alloc_
+    explicit multi_index_container(const Alloc& a) : alloc_(a) {}   // nalloc_/cores_ cascade from alloc_
 
     multi_index_container(const multi_index_container& o)
         : alloc_(std::allocator_traits<Alloc>::select_on_container_copy_construction(o.alloc_)) { copy_from(o); }
     multi_index_container(const multi_index_container& o, const Alloc& a) : alloc_(a) { copy_from(o); }
     multi_index_container(multi_index_container&& o) noexcept
-        : alloc_(std::move(o.alloc_)), nalloc_(std::move(o.nalloc_)), registry_(std::move(o.registry_)),
-          cores_(std::move(o.cores_)), size_(o.size_) { o.size_ = 0; }
+        : alloc_(std::move(o.alloc_)), nalloc_(std::move(o.nalloc_)), cores_(std::move(o.cores_)),
+          rhead_(o.rhead_), rtail_(o.rtail_), size_(o.size_) { o.rhead_ = o.rtail_ = nullptr; o.size_ = 0; }
     multi_index_container& operator=(const multi_index_container& o) {
         if (this != &o) { clear(); copy_from(o); }
         return *this;
@@ -1202,8 +1212,9 @@ public:
     multi_index_container& operator=(multi_index_container&& o) noexcept {
         if (this != &o) {
             clear();
-            alloc_ = std::move(o.alloc_); nalloc_ = std::move(o.nalloc_); registry_ = std::move(o.registry_);
-            cores_ = std::move(o.cores_); size_ = o.size_; o.size_ = 0;
+            alloc_ = std::move(o.alloc_); nalloc_ = std::move(o.nalloc_); cores_ = std::move(o.cores_);
+            rhead_ = o.rhead_; rtail_ = o.rtail_; size_ = o.size_;
+            o.rhead_ = o.rtail_ = nullptr; o.size_ = 0;
         }
         return *this;
     }
@@ -1222,14 +1233,14 @@ public:
     std::size_t size()  const noexcept { return size_; }
     bool        empty() const noexcept { return size_ == 0; }
     void clear() {
-        for (node* p : registry_) destroy_node(p);
-        registry_.clear();
+        for (node* p = rhead_; p; ) { node* nx = p->rnext; destroy_node(p); p = nx; }
+        rhead_ = rtail_ = nullptr;
         std::apply([](auto&... co) { (co.c.clear(), ...); }, cores_);
         size_ = 0;
     }
     void swap(multi_index_container& o) noexcept {
         using std::swap;
-        swap(alloc_, o.alloc_);   swap(nalloc_, o.nalloc_); swap(registry_, o.registry_);
+        swap(alloc_, o.alloc_);   swap(nalloc_, o.nalloc_); swap(rhead_, o.rhead_); swap(rtail_, o.rtail_);
         swap(cores_, o.cores_);   swap(size_, o.size_);
     }
     friend void swap(multi_index_container& a, multi_index_container& b) noexcept { a.swap(b); }
@@ -1284,7 +1295,7 @@ private:
             visit_tag(failed, [&](std::string_view t) { e.index_tag = t; });
             return std::unexpected(e);
         }
-        registry_.push_back(p); p->self = std::prev(registry_.end()); ++size_;
+        reg_push_back(p); ++size_;
         return make_iter<0>(p);
     }
     template <class F> void visit_tag(std::size_t pos, F&& f) {
@@ -1306,7 +1317,7 @@ public:
     // ---- node-handle transfer & merge ------------------------------------
     node_handle extract(iterator pos) {
         node* p = pos.get_node();
-        remove_all<0>(p); registry_.erase(p->self); --size_;
+        remove_all<0>(p); reg_unlink(p); --size_;
         return node_handle{ nalloc_, p };
     }
     insert_return_type insert(node_handle&& h) {
@@ -1317,14 +1328,15 @@ public:
             return { make_iter<0>(conflict), false, std::move(h) };
         }
         h.p_ = nullptr;   // ownership adopted by this container
-        registry_.push_back(p); p->self = std::prev(registry_.end()); ++size_;
+        reg_push_back(p); ++size_;
         return { make_iter<0>(p), true, node_handle{} };
     }
     void merge(multi_index_container& other) {
         if (this == &other) return;
-        std::vector<node*> all(other.registry_.begin(), other.registry_.end());
+        std::vector<node*> all;
+        for (node* p = other.rhead_; p; p = p->rnext) all.push_back(p);
         for (node* p : all) {
-            other.remove_all<0>(p); other.registry_.erase(p->self); --other.size_;
+            other.remove_all<0>(p); other.reg_unlink(p); --other.size_;
             node_handle h{ other.nalloc_, p };
             auto r = insert(std::move(h));
             if (!r.inserted) (void)other.insert(std::move(r.node));
