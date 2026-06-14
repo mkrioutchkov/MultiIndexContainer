@@ -119,6 +119,10 @@ Known limitations, slated for later work:
   yet); ordered lookup *is* transparent and zero-materialisation.
 * **One tag per index** (Boost allows multiple); **stateless,
   default-constructible** comparators/hashers/extractors are assumed.
+* **`modify()`** repositions only the indices whose key actually changed, so
+  iterators into *unchanged* indices stay valid (as in Boost). The one
+  unsupported combination is changing a **hashed** index's key on a
+  **pointer-stored** element via `modify()` — use value storage or `replace()`.
 * Not yet implemented: serialization, `std::pmr` allocator plumbing for the
   index structures, the concurrent variants, and coroutine query helpers.
 

@@ -238,6 +238,32 @@ void test_const_element_mode() {
     CHECK((ids == std::vector<std::uint64_t>{2, 100}));
 }
 
+// ---------------------------------------------------------------------------
+void test_modify_preserves_iterators() {
+    std::println("[test] modify repositions only changed indices (other iterators stay valid)");
+    using Table = mic::multi_index_container<Employee,
+        mic::indexed_by<
+            mic::ordered_unique   <"by_id",     mic::key<&Employee::id>>,
+            mic::ranked_non_unique<"by_salary", mic::key<&Employee::salary>>,
+            mic::hashed_unique    <"by_email",  mic::key<&Employee::email>>
+        >>;
+    Table t;
+    t.insert(Employee{1, "A", "a@x", 100});
+    t.insert(Employee{2, "B", "b@x", 200});
+
+    // Hold an iterator into by_id, then modify a DIFFERENT index's key (salary).
+    // by_id is unchanged, so 'it' must remain valid and reusable afterwards
+    // (this is the pattern that aborts under MSVC checked iterators if modify
+    // needlessly re-threads every index).
+    auto it = t.get<"by_id">().find(1);
+    bool ok = t.get<"by_id">().modify(it, [](Employee& e) { e.salary = 50; });
+    CHECK(ok);
+    CHECK(it->id == 1);            // reuse the iterator held across modify()
+    CHECK(it->salary == 50);
+    CHECK(t.get<"by_salary">().nth(0)->id == 1);   // by_salary was repositioned
+    CHECK(t.get<"by_email">().find("a@x")->salary == 50);
+}
+
 } // namespace
 
 int main() {
@@ -248,6 +274,7 @@ int main() {
     test_projection_and_nodehandle();
     test_expected_and_ranges();
     test_const_element_mode();
+    test_modify_preserves_iterators();
 
     std::println("\n{}/{} checks passed", g_checks - g_fail, g_checks);
     return g_fail == 0 ? 0 : 1;

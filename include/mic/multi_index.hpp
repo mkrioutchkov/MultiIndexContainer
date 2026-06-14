@@ -325,6 +325,10 @@ struct ordered_core {
         if constexpr (std::is_same_v<std::remove_cvref_t<T>, NodePtr>) return Extractor{}((*t).value);
         else return (t);
     }
+    template <class V> static key_type extract_key(const V& v) { return Extractor{}(v); }
+    static bool keys_equal(const key_type& a, const key_type& b) {
+        return !Compare{}(a, b) && !Compare{}(b, a);
+    }
     struct node_compare {
         using is_transparent = void;
         template <class A, class B> bool operator()(const A& a, const B& b) const {
@@ -357,6 +361,8 @@ struct hashed_core {
         if constexpr (std::is_same_v<std::remove_cvref_t<T>, NodePtr>) return Extractor{}((*t).value);
         else return (t);
     }
+    template <class V> static key_type extract_key(const V& v) { return Extractor{}(v); }
+    static bool keys_equal(const key_type& a, const key_type& b) { return Eq{}(a, b); }
     struct node_hash {
         using is_transparent = void;
         template <class T> std::size_t operator()(const T& t) const { return Hash{}(keyof(t)); }
@@ -644,49 +650,97 @@ private:
         return { make_iter<0>(p), true };
     }
 
-    // Re-thread p under its current keys; if that somehow fails (a throwing
-    // comparator/hasher, bad_alloc), drop the node so the invariant
-    // "registered == indexed in every core" is never violated.
-    void rethread_or_drop(node* p) {
-        node* c = nullptr; std::size_t f = N;
-        if (!insert_all<0>(p, c, f)) { registry_.erase(p->self); destroy_node(p); --size_; }
+    // Old keys must be captured BY VALUE before the mutator runs: when Value is a
+    // pointer (shared_ptr<T> ...), a copy of Value shares the pointee, so it would
+    // not preserve the pre-mutation key. monostate for keyless (seq/random) indices.
+    template <std::size_t I> using core_key_t = typename detail::core_key<core_at<I>>::type;
+    template <class K> using key_slot = std::conditional_t<std::is_void_v<K>, std::monostate, K>;
+    template <class Seq> struct oldkeys_tt;
+    template <std::size_t... I> struct oldkeys_tt<std::index_sequence<I...>> {
+        using type = std::tuple<key_slot<core_key_t<I>>...>;
+    };
+    using oldkeys_tuple = typename oldkeys_tt<std::make_index_sequence<N>>::type;
+
+    template <std::size_t I> void capture_one(const Value& v, oldkeys_tuple& out) const {
+        using Core = core_at<I>;
+        if constexpr (Core::kind != index_kind::sequenced && Core::kind != index_kind::random_access)
+            std::get<I>(out) = Core::extract_key(v);
     }
+    void capture_keys(const Value& v, oldkeys_tuple& out) const {
+        [&]<std::size_t... I>(std::index_sequence<I...>) { (capture_one<I>(v, out), ...); }(std::make_index_sequence<N>{});
+    }
+    template <std::size_t I, class Arr> void changed_one(const oldkeys_tuple& old, const Value& newv, Arr& ch) const {
+        using Core = core_at<I>;
+        if constexpr (Core::kind == index_kind::sequenced || Core::kind == index_kind::random_access)
+            ch[I] = false;
+        else
+            ch[I] = !Core::keys_equal(std::get<I>(old), Core::extract_key(newv));
+    }
+    template <class Arr>
+    void compute_changed(const oldkeys_tuple& old, const Value& newv, Arr& ch) const {
+        [&]<std::size_t... I>(std::index_sequence<I...>) { (changed_one<I>(old, newv, ch), ...); }(std::make_index_sequence<N>{});
+    }
+    template <class Arr>
+    void erase_changed(node* p, const Arr& ch) {
+        [&]<std::size_t... I>(std::index_sequence<I...>) {
+            ((ch[I] ? (std::get<I>(cores_).remove(p, std::get<I>(p->hooks)), void()) : void()), ...);
+        }(std::make_index_sequence<N>{});
+    }
+    template <std::size_t I, class Arr>
+    bool insert_changed(node* p, const Arr& ch, node*& conflict, std::size_t& failed) {
+        if constexpr (I == N) { return true; }
+        else {
+            if (ch[I]) {
+                node* cf = nullptr;
+                if (!std::get<I>(cores_).try_insert(p, std::get<I>(p->hooks), cf)) { conflict = cf; failed = I; return false; }
+                if (!insert_changed<I + 1>(p, ch, conflict, failed)) { std::get<I>(cores_).remove(p, std::get<I>(p->hooks)); return false; }
+                return true;
+            }
+            return insert_changed<I + 1>(p, ch, conflict, failed);
+        }
+    }
+
+    // modify()/replace() reposition ONLY the indices whose key actually changed,
+    // leaving the rest — and any iterators/references into them — untouched
+    // (matching Boost's "modify does not invalidate iterators"). Rollback-and-keep
+    // on a unique clash; strong guarantee if the mutator throws (no index touched).
     template <class F>
     bool modify_node(node* p, F&& f) {
         static_assert(std::is_copy_constructible_v<Value>,
                       "modify() rollback requires a copy-constructible value_type");
-        remove_all<0>(p);
+        oldkeys_tuple oldk; capture_keys(p->value, oldk);
         Value snapshot = p->value;
-        try {
-            std::forward<F>(f)(p->value);
-        } catch (...) {                    // mutator threw: restore and re-thread
-            p->value = std::move(snapshot);
-            rethread_or_drop(p);
-            throw;
-        }
-        node* conflict = nullptr; std::size_t failed = N;
-        if (insert_all<0>(p, conflict, failed)) return true;
-        p->value = std::move(snapshot);    // rollback-and-keep
-        rethread_or_drop(p);
-        return false;
+        try { std::forward<F>(f)(p->value); }
+        catch (...) { p->value = std::move(snapshot); throw; }
+        return reposition(p, oldk, snapshot);
     }
     template <class V>
     bool replace_node(node* p, V&& v) {
         static_assert(std::is_move_constructible_v<Value>,
                       "replace() requires a move-constructible value_type for rollback");
-        remove_all<0>(p);
+        oldkeys_tuple oldk; capture_keys(p->value, oldk);
         Value snapshot = std::move(p->value);
-        try {
-            p->value = std::forward<V>(v);
-        } catch (...) {
-            p->value = std::move(snapshot);
-            rethread_or_drop(p);
-            throw;
-        }
+        try { p->value = std::forward<V>(v); }
+        catch (...) { p->value = std::move(snapshot); throw; }
+        return reposition(p, oldk, snapshot);
+    }
+    // p is already mutated; `oldk` holds the pre-mutation keys, `snapshot` the
+    // previous value. Move p within the indices whose key changed (all-or-nothing
+    // uniqueness); on clash, restore the snapshot and return false (element stays).
+    bool reposition(node* p, const oldkeys_tuple& oldk, Value& snapshot) {
+        std::array<bool, N> ch{};
+        compute_changed(oldk, p->value, ch);             // p->value holds the NEW value
+        // Erase the changed indices while the element still reflects its OLD keys:
+        // a hashed index's erase-by-iterator re-derives the bucket from the current
+        // value, so it must see the old key to unlink the node from the right bucket.
+        std::swap(p->value, snapshot);                   // p->value = OLD, snapshot = NEW
+        erase_changed(p, ch);
+        std::swap(p->value, snapshot);                   // p->value = NEW again
         node* conflict = nullptr; std::size_t failed = N;
-        if (insert_all<0>(p, conflict, failed)) return true;
-        p->value = std::move(snapshot);
-        rethread_or_drop(p);
+        if (insert_changed<0>(p, ch, conflict, failed)) return true;
+        p->value = std::move(snapshot);                  // rollback-and-keep (restore OLD keys)
+        node* c2 = nullptr; std::size_t f2 = N;
+        if (!insert_changed<0>(p, ch, c2, f2)) { registry_.erase(p->self); destroy_node(p); --size_; }
         return false;
     }
     void erase_node_full(node* p) {
