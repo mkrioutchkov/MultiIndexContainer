@@ -658,17 +658,76 @@ struct hash_core {
     void remove(NodePtr p, hook_type&) { c.erase_node(p); }
 };
 
-template <class NodePtr, class Alloc>
+// Intrusive doubly-linked list for sequenced indices (links in the node).
+template <class NodePtr>
+struct seq_hook { NodePtr prev = nullptr, next = nullptr; };
+
+template <std::size_t I, class NodePtr>
+class intrusive_list {
+    static seq_hook<NodePtr>& H(NodePtr p) { return std::get<I>(p->hooks); }
+    NodePtr head_ = nullptr, tail_ = nullptr;
+    void unlink(NodePtr p) {
+        (H(p).prev ? H(H(p).prev).next : head_) = H(p).next;
+        (H(p).next ? H(H(p).next).prev : tail_) = H(p).prev;
+    }
+public:
+    intrusive_list() = default;
+    intrusive_list(intrusive_list&& o) noexcept : head_(o.head_), tail_(o.tail_) { o.head_ = o.tail_ = nullptr; }
+    intrusive_list& operator=(intrusive_list&& o) noexcept { head_ = o.head_; tail_ = o.tail_; o.head_ = o.tail_ = nullptr; return *this; }
+    intrusive_list(const intrusive_list&) = delete;
+    intrusive_list& operator=(const intrusive_list&) = delete;
+    void clear() { head_ = tail_ = nullptr; }   // nodes freed by the container
+    void swap(intrusive_list& o) noexcept { using std::swap; swap(head_, o.head_); swap(tail_, o.tail_); }
+
+    void push_back(NodePtr p) { H(p).prev = tail_; H(p).next = nullptr; (tail_ ? H(tail_).next : head_) = p; tail_ = p; }
+    void erase(NodePtr p) { unlink(p); }
+    void move_to_front(NodePtr p) { unlink(p); H(p).prev = nullptr; H(p).next = head_; (head_ ? H(head_).prev : tail_) = p; head_ = p; }
+    void relocate(NodePtr before, NodePtr p) {        // move p to just before `before` (null -> back)
+        if (p == before) return;
+        unlink(p);
+        if (!before) { push_back(p); return; }
+        NodePtr pr = H(before).prev;
+        H(p).prev = pr; H(p).next = before;
+        (pr ? H(pr).next : head_) = p;
+        H(before).prev = p;
+    }
+    void reverse() {
+        for (NodePtr c = head_; c; ) { NodePtr nx = H(c).next; std::swap(H(c).prev, H(c).next); c = nx; }
+        std::swap(head_, tail_);
+    }
+    struct iterator {
+        const intrusive_list* lst = nullptr;
+        NodePtr cur = nullptr;
+        using value_type        = NodePtr;
+        using reference         = NodePtr;
+        using pointer           = NodePtr;
+        using difference_type   = std::ptrdiff_t;
+        using iterator_category = std::bidirectional_iterator_tag;
+        using iterator_concept  = std::bidirectional_iterator_tag;
+        iterator() = default;
+        iterator(const intrusive_list* l, NodePtr c) : lst(l), cur(c) {}
+        reference operator*()  const { return cur; }
+        iterator& operator++() { cur = H(cur).next; return *this; }
+        iterator  operator++(int) { auto t = *this; ++*this; return t; }
+        iterator& operator--() { cur = cur ? H(cur).prev : lst->tail_; return *this; }
+        iterator  operator--(int) { auto t = *this; --*this; return t; }
+        bool operator==(const iterator& o) const { return cur == o.cur; }
+    };
+    using const_iterator = iterator;
+    iterator begin() const { return { this, head_ }; }
+    iterator end()   const { return { this, nullptr }; }
+};
+
+template <std::size_t I, class NodePtr, class Alloc>
 struct seq_core {
     static constexpr index_kind kind = index_kind::sequenced;
-    using ptr_alloc = typename std::allocator_traits<Alloc>::template rebind_alloc<NodePtr>;
-    using container = std::list<NodePtr, ptr_alloc>;
-    using hook_type = typename container::iterator;
+    using container = intrusive_list<I, NodePtr>;
+    using hook_type = seq_hook<NodePtr>;
     container c;
     seq_core() = default;
-    explicit seq_core(const Alloc& a) : c(ptr_alloc(a)) {}
-    bool try_insert(NodePtr p, hook_type& out, NodePtr&) { c.push_back(p); out = std::prev(c.end()); return true; }
-    void remove(NodePtr, hook_type& h) { c.erase(h); }
+    explicit seq_core(const Alloc&) {}
+    bool try_insert(NodePtr p, hook_type&, NodePtr&) { c.push_back(p); return true; }
+    void remove(NodePtr p, hook_type&) { c.erase(p); }
 };
 
 template <class NodePtr, class Alloc>
@@ -703,7 +762,7 @@ struct core_for<hashed_unique<T, E, H, Q>, NP, A, I> { using type = hash_core<I,
 template <fixed_string T, class E, class H, class Q, class NP, class A, std::size_t I>
 struct core_for<hashed_non_unique<T, E, H, Q>, NP, A, I> { using type = hash_core<I, NP, E, H, Q, false, A>; };
 template <fixed_string T, class NP, class A, std::size_t I>
-struct core_for<sequenced<T>, NP, A, I> { using type = seq_core<NP, A>; };
+struct core_for<sequenced<T>, NP, A, I> { using type = seq_core<I, NP, A>; };
 template <fixed_string T, class NP, class A, std::size_t I>
 struct core_for<random_access<T>, NP, A, I> { using type = rand_core<NP, A>; };
 
@@ -922,10 +981,8 @@ private:
         if constexpr (Core::kind == index_kind::random_access) {
             auto& c = std::get<I>(cores_).c;
             return iter_t<I>{ std::find(c.begin(), c.end(), p) };
-        } else if constexpr (Core::kind == index_kind::ordered || Core::kind == index_kind::hashed) {
-            return iter_t<I>{ typename Core::container::iterator{ &std::get<I>(cores_).c, p } };   // intrusive tree/hash
-        } else {                                                    // sequenced: hook IS the std::list iterator
-            return iter_t<I>{ std::get<I>(p->hooks) };
+        } else {   // ordered (tree), hashed, sequenced: all intrusive -> build iterator from (container, node)
+            return iter_t<I>{ typename Core::container::iterator{ &std::get<I>(cores_).c, p } };
         }
     }
     template <std::size_t I> iter_t<I> end_iter() { return iter_t<I>{ std::get<I>(cores_).c.end() }; }
@@ -1185,13 +1242,13 @@ public:
         }
         template <class V> std::pair<iterator, bool> push_front(V&& v) const requires (kind == index_kind::sequenced) {
             auto r = push_back(std::forward<V>(v));
-            if (r.second) { core().c.splice(core().c.begin(), core().c, r.first.base()); }
+            if (r.second) { core().c.move_to_front(r.first.get_node()); }
             return r;
         }
         void pop_front() const requires (kind == index_kind::sequenced) { erase(begin()); }
         void pop_back()  const requires (kind == index_kind::sequenced) { auto e = end(); --e; erase(e); }
         void relocate(iterator pos, iterator it) const requires (kind == index_kind::sequenced) {
-            core().c.splice(pos.base(), core().c, it.base());
+            core().c.relocate(pos.get_node(), it.get_node());   // move `it` before `pos` (pos==end -> back)
         }
         void reverse() const requires (kind == index_kind::sequenced) { core().c.reverse(); }
 
