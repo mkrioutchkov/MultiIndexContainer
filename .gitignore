@@ -2,6 +2,10 @@
 build/
 out/
 cmake-build-*/
+# Visual Studio per-config output
+x64/
+Win32/
+*.vcxproj.user
 *.exe
 *.obj
 *.o
