@@ -8,6 +8,8 @@
 
 #include "mic/multi_index.hpp"
 
+#include <algorithm>
+#include <array>
 #include <cassert>
 #include <cstdint>
 #include <functional>
@@ -41,6 +43,20 @@ struct Rec {
     int          score;
     std::string  category() const { return name.empty() ? "?" : std::string(1, name[0]); }
 };
+
+// Compile-time guard for the EXAMPLES.md §13 constexpr-table snippet (a mic
+// container can't be constexpr; this is the documented working equivalent). The
+// static_asserts run the lookup during translation, so a green build proves it.
+namespace md_section13 {
+struct KW { std::string_view word; int id; };
+constexpr std::array KEYWORDS = std::to_array<KW>({ {"else", 2}, {"if", 1}, {"while", 3} });
+constexpr const KW* find_kw(std::string_view w) {
+    auto it = std::ranges::lower_bound(KEYWORDS, w, {}, &KW::word);
+    return (it != KEYWORDS.end() && it->word == w) ? &*it : nullptr;
+}
+static_assert(find_kw("while") && find_kw("while")->id == 3);
+static_assert(find_kw("switch") == nullptr);
+}
 
 // ===========================================================================
 void test_sequenced() {

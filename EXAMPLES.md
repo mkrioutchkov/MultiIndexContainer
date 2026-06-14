@@ -374,29 +374,14 @@ for (auto&& [dept, group] : mic::queries::group_by(staff.get<"by_dept">()))
 
 ---
 
-## 13. Compile-time tables (`constexpr`) — *future work*
+## 13. Compile-time tables (`constexpr`)
 
-**Not supported in v1.** The single-allocation intrusive design relies on runtime
-pointer manipulation that isn't valid in a constant expression, so a `mic` container
-can't be built at compile time. The sketch below is the intended shape *if* a
-constexpr-friendly storage backend is ever added:
-
-```cpp
-// FUTURE WORK — does not compile today.
-consteval auto build_keywords() {
-    mic::multi_index<std::pair<std::string_view,int>,
-        mic::indexed_by<mic::ordered_unique<"by_word",
-            mic::key<&std::pair<std::string_view,int>::first>>>> t;
-    t.insert({"if", 1}); t.insert({"else", 2}); t.insert({"while", 3});
-    return t;
-}
-constexpr auto KEYWORDS = build_keywords();
-static_assert(KEYWORDS.get<"by_word">().contains("while"));
-```
-
-The **working close equivalent today** is a `constexpr` sorted `std::array` with a
-binary search — exactly the lookup an ordered index would do, just evaluated at
-compile time:
+A `mic` container **can't** be built at compile time: the single-allocation
+intrusive design needs runtime pointer manipulation that isn't valid in a constant
+expression. For a small fixed lookup table the idiomatic answer is a `constexpr`
+sorted `std::array` with a binary search — exactly the lookup an ordered index
+does, just evaluated at compile time. The snippet below compiles as-is (its
+`static_assert`s run the lookup during translation):
 
 ```cpp
 struct KW { std::string_view word; int id; };
