@@ -100,13 +100,27 @@ tools\msvc.bat /std:c++latest /EHsc /I include /Fe:build\tests.exe tests\test_ma
 build\tests.exe
 ```
 
+## Benchmarking & profiling
+
+```bash
+cmake -B build -S . -DMIC_BUILD_BENCHMARKS=ON && cmake --build build --config Release
+./build/mic_bench_bench 100000 1000000          # mic vs hand-rolled std (vs Boost if present)
+```
+
+The harness in [`benchmarks/bench.cpp`](benchmarks/bench.cpp) is dependency-free
+and runs anywhere. For numbers you can trust, **don't use a laptop** — see
+[`BENCHMARKING.md`](BENCHMARKING.md) for a quiet cloud "sandpit" recipe, build
+flags, allocation profiling, and `perf` / VTune / Google Benchmark workflows.
+
 ## Documentation
 
 * [`PROMPT.md`](PROMPT.md) — the full engineering specification this implements
   toward.
 * [`EXAMPLES.md`](EXAMPLES.md) — annotated API usage examples.
-* [`examples/`](examples) — complete, compiled example programs
-  (LRU cache, order book).
+* [`BENCHMARKING.md`](BENCHMARKING.md) — how to profile and benchmark properly.
+* [`examples/`](examples) — complete, compiled example programs: LRU cache,
+  order book, const-element safety, observer registry, symbol table.
+* [`playground/`](playground) — a Visual Studio project; open the `.sln`, press F5.
 
 ## Status & v1 limitations
 
