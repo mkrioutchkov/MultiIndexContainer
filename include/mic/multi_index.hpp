@@ -335,59 +335,170 @@ struct indexed_by {
 // ---------------------------------------------------------------------------
 namespace detail {
 
-template <class NodePtr, class Extractor, class Compare, bool Unique, class Alloc>
-struct ordered_core {
+// Intrusive tree linkage stored inside the element node (one per ordered/ranked
+// index). No separate allocation: the index lives in the node it indexes.
+template <class NodePtr>
+struct tree_hook {
+    NodePtr l = nullptr, r = nullptr, up = nullptr;
+    std::size_t   sz   = 1;
+    std::uint32_t prio = 0;
+};
+
+// Size-augmented treap whose links live in std::get<I>(node->hooks). Backs both
+// ordered indices (find/lower_bound/...) and ranked indices (nth/rank, O(log n)).
+// Comparisons re-extract the key from the node's co-located value (same cache
+// line as the links), so lookups are fast without duplicating the key.
+template <std::size_t I, class NodePtr, class Compare, bool Unique>
+class intrusive_tree {
+    static tree_hook<NodePtr>& H(NodePtr p) { return std::get<I>(p->hooks); }
+    static std::size_t S(NodePtr p) { return p ? H(p).sz : 0; }
+    static void upd(NodePtr p) { if (p) H(p).sz = 1 + S(H(p).l) + S(H(p).r); }
+    static NodePtr leftmost(NodePtr p)  { if (!p) return nullptr; while (H(p).l) p = H(p).l; return p; }
+    static NodePtr rightmost(NodePtr p) { if (!p) return nullptr; while (H(p).r) p = H(p).r; return p; }
+    static NodePtr succ(NodePtr p) { if (H(p).r) return leftmost(H(p).r); while (H(p).up && p == H(H(p).up).r) p = H(p).up; return H(p).up; }
+    static NodePtr pred(NodePtr p) { if (H(p).l) return rightmost(H(p).l); while (H(p).up && p == H(H(p).up).l) p = H(p).up; return H(p).up; }
+
+    NodePtr root_ = nullptr;
+    std::size_t n_ = 0;
+    std::uint32_t rng_ = 2463534242u;
+    std::uint32_t rand_prio() { std::uint32_t x = rng_; x ^= x << 13; x ^= x >> 17; x ^= x << 5; rng_ = x; return x; }
+
+    void rot_right(NodePtr y) {
+        NodePtr x = H(y).l, p = H(y).up;
+        H(y).l = H(x).r; if (H(x).r) H(H(x).r).up = y;
+        H(x).r = y; H(y).up = x; H(x).up = p;
+        if (p) { if (H(p).l == y) H(p).l = x; else H(p).r = x; } else root_ = x;
+        upd(y); upd(x);
+    }
+    void rot_left(NodePtr y) {
+        NodePtr x = H(y).r, p = H(y).up;
+        H(y).r = H(x).l; if (H(x).l) H(H(x).l).up = y;
+        H(x).l = y; H(y).up = x; H(x).up = p;
+        if (p) { if (H(p).l == y) H(p).l = x; else H(p).r = x; } else root_ = x;
+        upd(y); upd(x);
+    }
+    template <class K> NodePtr lb(const K& k) const {
+        NodePtr t = root_, res = nullptr;
+        while (t) { if (Compare{}(t, k)) t = H(t).r; else { res = t; t = H(t).l; } }
+        return res;
+    }
+    template <class K> NodePtr ub(const K& k) const {
+        NodePtr t = root_, res = nullptr;
+        while (t) { if (Compare{}(k, t)) { res = t; t = H(t).l; } else t = H(t).r; }
+        return res;
+    }
+    void link_in(NodePtr nn) {
+        H(nn) = tree_hook<NodePtr>{}; H(nn).prio = rand_prio();
+        if (!root_) { root_ = nn; ++n_; return; }
+        NodePtr t = root_, par = nullptr; bool left = false;
+        while (t) { par = t; if (Compare{}(nn, t)) { left = true; t = H(t).l; } else { left = false; t = H(t).r; } }
+        H(nn).up = par; (left ? H(par).l : H(par).r) = nn; ++n_;
+        for (NodePtr a = par; a; a = H(a).up) ++H(a).sz;
+        while (H(nn).up && H(nn).prio > H(H(nn).up).prio) {
+            if (nn == H(H(nn).up).l) rot_right(H(nn).up); else rot_left(H(nn).up);
+        }
+    }
+
+public:
+    intrusive_tree() = default;
+    intrusive_tree(intrusive_tree&& o) noexcept : root_(o.root_), n_(o.n_), rng_(o.rng_) { o.root_ = nullptr; o.n_ = 0; }
+    intrusive_tree& operator=(intrusive_tree&& o) noexcept { root_ = o.root_; n_ = o.n_; rng_ = o.rng_; o.root_ = nullptr; o.n_ = 0; return *this; }
+    intrusive_tree(const intrusive_tree&) = delete;
+    intrusive_tree& operator=(const intrusive_tree&) = delete;
+
+    void clear() { root_ = nullptr; n_ = 0; }   // nodes are owned/freed by the container
+    void swap(intrusive_tree& o) noexcept { using std::swap; swap(root_, o.root_); swap(n_, o.n_); swap(rng_, o.rng_); }
+    std::size_t size() const { return n_; }
+    bool empty() const { return n_ == 0; }
+
+    struct iterator {
+        const intrusive_tree* tree = nullptr;
+        NodePtr cur = nullptr;
+        using value_type        = NodePtr;
+        using reference         = NodePtr;
+        using pointer           = NodePtr;
+        using difference_type   = std::ptrdiff_t;
+        using iterator_category = std::bidirectional_iterator_tag;
+        using iterator_concept  = std::bidirectional_iterator_tag;
+        iterator() = default;
+        iterator(const intrusive_tree* t, NodePtr c) : tree(t), cur(c) {}
+        reference operator*()  const { return cur; }
+        iterator& operator++() { cur = succ(cur); return *this; }
+        iterator  operator++(int) { auto t = *this; ++*this; return t; }
+        iterator& operator--() { cur = cur ? pred(cur) : rightmost(tree->root_); return *this; }
+        iterator  operator--(int) { auto t = *this; --*this; return t; }
+        bool operator==(const iterator& o) const { return cur == o.cur; }
+    };
+    using const_iterator = iterator;
+    iterator begin() const { return { this, leftmost(root_) }; }
+    iterator end()   const { return { this, nullptr }; }
+
+    template <class K> iterator lower_bound(const K& k) const { return { this, lb(k) }; }
+    template <class K> iterator upper_bound(const K& k) const { return { this, ub(k) }; }
+    template <class K> iterator find(const K& k) const {
+        NodePtr t = lb(k);
+        return (t && !Compare{}(k, t)) ? iterator{ this, t } : end();
+    }
+    template <class K> std::pair<iterator, iterator> equal_range(const K& k) const { return { lower_bound(k), upper_bound(k) }; }
+    template <class K> std::size_t count(const K& k) const {
+        std::size_t c = 0; for (auto it = lower_bound(k), e = upper_bound(k); it != e; ++it) ++c; return c;
+    }
+    iterator nth(std::size_t k) const {
+        NodePtr t = root_;
+        while (t) { std::size_t ls = S(H(t).l); if (k < ls) t = H(t).l; else if (k == ls) return { this, t }; else { k -= ls + 1; t = H(t).r; } }
+        return end();
+    }
+    std::size_t rank(iterator it) const {
+        NodePtr t = it.cur;
+        if (!t) return n_;
+        std::size_t r = S(H(t).l);
+        while (H(t).up) { if (t == H(H(t).up).r) r += S(H(H(t).up).l) + 1; t = H(t).up; }
+        return r;
+    }
+    bool try_add(NodePtr p, NodePtr& conflict) {
+        if constexpr (Unique) {
+            NodePtr e = lb(p);
+            if (e && !Compare{}(p, e)) { conflict = e; return false; }
+        }
+        link_in(p);
+        return true;
+    }
+    void erase_node(NodePtr z) {
+        while (H(z).l || H(z).r) {
+            if (!H(z).r || (H(z).l && H(H(z).l).prio > H(H(z).r).prio)) rot_right(z);
+            else rot_left(z);
+        }
+        NodePtr p = H(z).up;
+        if (p) { if (H(p).l == z) H(p).l = nullptr; else H(p).r = nullptr; } else root_ = nullptr;
+        for (NodePtr a = p; a; a = H(a).up) --H(a).sz;
+        --n_;
+    }
+};
+
+template <std::size_t I, class NodePtr, class Extractor, class Compare, bool Unique, class Alloc>
+struct tree_core {
     static constexpr index_kind kind = index_kind::ordered;
     using key_type = std::remove_cvref_t<typename Extractor::result_type>;
 
     template <class V> static key_type extract_key(const V& v) { return Extractor{}(v); }
-    static bool keys_equal(const key_type& a, const key_type& b) {
-        return !Compare{}(a, b) && !Compare{}(b, a);
-    }
-
-    // For a small, trivially-copyable key (e.g. an int id) we store the key INLINE
-    // beside the node pointer, so a comparison reads the key directly instead of
-    // chasing node* -> node -> value -> key. For string/large keys we keep just
-    // the pointer (no memory regression; comparison cost dominates the indirection).
-    static constexpr bool inline_key =
-        std::is_trivially_copyable_v<key_type> && std::is_default_constructible_v<key_type> && sizeof(key_type) <= 16;
-    struct entry { key_type key; NodePtr p; };
-    using stored = std::conditional_t<inline_key, entry, NodePtr>;
-    static NodePtr node_of(const stored& s) { if constexpr (inline_key) return s.p; else return s; }
+    static bool keys_equal(const key_type& a, const key_type& b) { return !Compare{}(a, b) && !Compare{}(b, a); }
 
     struct node_compare {
         using is_transparent = void;
         template <class T> static decltype(auto) kof(const T& t) {
             if constexpr (std::is_same_v<std::remove_cvref_t<T>, NodePtr>) return Extractor{}((*t).value);
-            else if constexpr (std::is_same_v<std::remove_cvref_t<T>, entry>) return (t.key);
-            else return (t);   // bare lookup key
+            else return (t);
         }
-        template <class A, class B> bool operator()(const A& a, const B& b) const {
-            return Compare{}(kof(a), kof(b));
-        }
+        template <class A, class B> bool operator()(const A& a, const B& b) const { return Compare{}(kof(a), kof(b)); }
     };
-    using ptr_alloc = typename std::allocator_traits<Alloc>::template rebind_alloc<stored>;
-    using container = std::conditional_t<Unique,
-        std::set<stored, node_compare, ptr_alloc>, std::multiset<stored, node_compare, ptr_alloc>>;
-    using hook_type = typename container::iterator;
+    using container = intrusive_tree<I, NodePtr, node_compare, Unique>;
+    using hook_type = tree_hook<NodePtr>;
     container c;
-    ordered_core() = default;
-    explicit ordered_core(const Alloc& a) : c(node_compare{}, ptr_alloc(a)) {}
+    tree_core() = default;
+    explicit tree_core(const Alloc&) {}   // intrusive: no allocation
 
-    static stored make_stored(NodePtr p) {
-        if constexpr (inline_key) return entry{ Extractor{}((*p).value), p };
-        else return p;
-    }
-    bool try_insert(NodePtr p, hook_type& out, NodePtr& conflict) {
-        if constexpr (Unique) {
-            auto [it, ok] = c.insert(make_stored(p));
-            if (!ok) { conflict = node_of(*it); return false; }
-            out = it; return true;
-        } else {
-            out = c.insert(make_stored(p)); return true;
-        }
-    }
-    void remove(NodePtr p, hook_type& h) { (void)p; c.erase(h); }
+    bool try_insert(NodePtr p, hook_type&, NodePtr& conflict) { return c.try_add(p, conflict); }
+    void remove(NodePtr p, hook_type&) { c.erase_node(p); }
 };
 
 template <class NodePtr, class Extractor, class Hash, class Eq, bool Unique, class Alloc>
@@ -646,24 +757,25 @@ struct ranked_core {
     void remove(NodePtr, hook_type& h) { c.erase(h); }
 };
 
-// map a spec to its core type
-template <class Spec, class NodePtr, class Alloc> struct core_for;
-template <fixed_string T, class E, class C, class NP, class A>
-struct core_for<ordered_unique<T, E, C>, NP, A> { using type = ordered_core<NP, E, C, true, A>; };
-template <fixed_string T, class E, class C, class NP, class A>
-struct core_for<ordered_non_unique<T, E, C>, NP, A> { using type = ordered_core<NP, E, C, false, A>; };
-template <fixed_string T, class E, class C, class NP, class A>
-struct core_for<ranked_unique<T, E, C>, NP, A> { using type = ranked_core<NP, E, C, true, A>; };
-template <fixed_string T, class E, class C, class NP, class A>
-struct core_for<ranked_non_unique<T, E, C>, NP, A> { using type = ranked_core<NP, E, C, false, A>; };
-template <fixed_string T, class E, class H, class Q, class NP, class A>
-struct core_for<hashed_unique<T, E, H, Q>, NP, A> { using type = hashed_core<NP, E, H, Q, true, A>; };
-template <fixed_string T, class E, class H, class Q, class NP, class A>
-struct core_for<hashed_non_unique<T, E, H, Q>, NP, A> { using type = hashed_core<NP, E, H, Q, false, A>; };
-template <fixed_string T, class NP, class A>
-struct core_for<sequenced<T>, NP, A> { using type = seq_core<NP, A>; };
-template <fixed_string T, class NP, class A>
-struct core_for<random_access<T>, NP, A> { using type = rand_core<NP, A>; };
+// map a spec to its core type (I = its position in the index tuple, used by the
+// intrusive cores to find their hook inside std::get<I>(node->hooks))
+template <class Spec, class NodePtr, class Alloc, std::size_t I> struct core_for;
+template <fixed_string T, class E, class C, class NP, class A, std::size_t I>
+struct core_for<ordered_unique<T, E, C>, NP, A, I> { using type = tree_core<I, NP, E, C, true, A>; };
+template <fixed_string T, class E, class C, class NP, class A, std::size_t I>
+struct core_for<ordered_non_unique<T, E, C>, NP, A, I> { using type = tree_core<I, NP, E, C, false, A>; };
+template <fixed_string T, class E, class C, class NP, class A, std::size_t I>
+struct core_for<ranked_unique<T, E, C>, NP, A, I> { using type = tree_core<I, NP, E, C, true, A>; };
+template <fixed_string T, class E, class C, class NP, class A, std::size_t I>
+struct core_for<ranked_non_unique<T, E, C>, NP, A, I> { using type = tree_core<I, NP, E, C, false, A>; };
+template <fixed_string T, class E, class H, class Q, class NP, class A, std::size_t I>
+struct core_for<hashed_unique<T, E, H, Q>, NP, A, I> { using type = hashed_core<NP, E, H, Q, true, A>; };
+template <fixed_string T, class E, class H, class Q, class NP, class A, std::size_t I>
+struct core_for<hashed_non_unique<T, E, H, Q>, NP, A, I> { using type = hashed_core<NP, E, H, Q, false, A>; };
+template <fixed_string T, class NP, class A, std::size_t I>
+struct core_for<sequenced<T>, NP, A, I> { using type = seq_core<NP, A>; };
+template <fixed_string T, class NP, class A, std::size_t I>
+struct core_for<random_access<T>, NP, A, I> { using type = rand_core<NP, A>; };
 
 template <class C, class = void> struct core_key { using type = void; };
 template <class C> struct core_key<C, std::void_t<typename C::key_type>> { using type = typename C::key_type; };
@@ -723,7 +835,7 @@ private:
     using elem_value = detail::pointee_t<Value>;
 
     struct node;
-    template <std::size_t I> using core_at = typename detail::core_for<spec_at<I>, node*, Alloc>::type;
+    template <std::size_t I> using core_at = typename detail::core_for<spec_at<I>, node*, Alloc, I>::type;
 
     template <class Seq> struct hooks_t;
     template <std::size_t... I> struct hooks_t<std::index_sequence<I...>> {
@@ -880,7 +992,9 @@ private:
         if constexpr (Core::kind == index_kind::random_access) {
             auto& c = std::get<I>(cores_).c;
             return iter_t<I>{ std::find(c.begin(), c.end(), p) };
-        } else {
+        } else if constexpr (Core::kind == index_kind::ordered) {   // intrusive tree: build from (tree, node)
+            return iter_t<I>{ typename Core::container::iterator{ &std::get<I>(cores_).c, p } };
+        } else {                                                    // hashed/sequenced: hook IS the std iterator
             return iter_t<I>{ std::get<I>(p->hooks) };
         }
     }
