@@ -13,20 +13,20 @@
 //  (tested on MSVC 14.51). Single-threaded; concurrent reads are safe, writes
 //  require external synchronisation (same contract as the std:: containers).
 //
-//  NOTE ON INTERNALS (v1): each element is stored once in a stable node and
-//  threaded into every index via a back-hook, so element addresses and
-//  iterators stay valid until the element is erased. Ordered/ranked indices are
-//  red-black trees (std::set/std::multiset), hashed indices are bucketed hash
-//  tables (std::unordered_set/_multiset), sequenced is a doubly-linked list and
-//  random-access is a pointer vector. Ranked rank()/nth() are O(n) in v1 (a
-//  documented limitation; an order-statistics tree is the planned upgrade).
+//  NOTE ON INTERNALS: each element lives in one stable, single allocation; every
+//  index's linkage is *intrusive* — stored inside the element node at
+//  std::get<I>(node->hooks) — so element addresses and iterators stay valid until
+//  the element is erased. Ordered/ranked indices are a size-augmented AVL tree
+//  (balanced like std::set; subtree sizes give O(log n) nth()/rank()), hashed
+//  indices are a bucketed hash table (chains threaded through the node; only the
+//  bucket array allocates), sequenced is an intrusive doubly-linked list, and
+//  the "all live nodes" registry is intrusive too. Only random-access keeps a
+//  pointer vector (as Boost.MultiIndex does). Net result: a container of
+//  ordered/ranked/hashed/sequenced indices does ONE allocation per element.
 // =============================================================================
 #ifndef MIC_MULTI_INDEX_HPP
 #define MIC_MULTI_INDEX_HPP
 
-#include <set>
-#include <unordered_set>
-#include <list>
 #include <vector>
 #include <tuple>
 #include <array>

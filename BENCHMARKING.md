@@ -215,22 +215,18 @@ and pin the process as in §1. Emit `--benchmark_out=results.json` and diff with
 
 So you can sanity-check your results against the implementation:
 
+* **Single-allocation, intrusive.** Every index's linkage lives inside the
+  element node, so a container of ordered/ranked/hashed/sequenced indices does
+  **one allocation per element** (random-access adds a pointer vector, as Boost
+  does). Expect `build` to **meet or beat Boost**.
 * **Ordered `find` matches `std::set`/Boost** — ordered/ranked indices are an
-  intrusive, size-augmented **AVL** tree (links inside the node, no separate
-  allocation), so they're balanced like `std::set` and single-allocation like
-  Boost. Small trivially-copyable keys are cached next to the links; `find(id)`
-  ties or beats Boost. (Hashed find is still ~1.3–1.5× Boost — `std::unordered_set`
-  vs Boost's intrusive hash.)
-* **Hashed `find` is transparent** — string keys hash through `string_view`, so
-  `find("literal")` / `find(string_view)` does no key materialisation; expect it
-  near `std::unordered_map`. (A non-transparent *user-supplied* hasher falls back
-  to materialising the key.)
-* **`build`** does `1 + #indices` allocations/element. With the default allocator
-  it's competitive with a hand-rolled std composition; with
-  `mic::pmr::multi_index_container` + a `monotonic_buffer_resource` it is roughly
-  **1.5–1.7× faster** (one arena serves every node and index structure).
-* **Iterate** is a linked-structure walk (node-based), so it's pointer-chasing,
-  not contiguous — a `storage::flat` policy (planned) would help cache locality.
+  intrusive, size-augmented **AVL** tree, balanced like `std::set`. Small
+  trivially-copyable keys are cached next to the links; `find(id)` ties Boost.
+* **Hashed `find` is transparent** (string keys hash through `string_view`, no
+  materialisation) and intrusive (chains in the node). It beats `std::unordered`
+  but is still ~1.3–1.5× Boost's hand-tuned intrusive hash.
+* **Iterate** is a node-based pointer walk; with intrusive nodes it's at parity
+  with Boost. A contiguous `storage::flat` policy could still help cache locality.
 * **Ranked `nth`/`rank` are O(log n)** — backed by a size-augmented
   order-statistics tree (a randomised treap), so `nth(k)` stays in the hundreds
   of nanoseconds even at N = 10⁶ (it should grow log-shaped, not linearly).
