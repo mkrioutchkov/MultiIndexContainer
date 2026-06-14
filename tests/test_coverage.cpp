@@ -353,6 +353,19 @@ void test_node_handle_and_merge() {
     CHECK(ret.inserted);
     CHECK(t.get<"by_id">().contains(100));
 
+    // proxy-level extract by key and by iterator (re-key while detached), then
+    // restore id 100 so the rest of the test sees unchanged state.
+    auto nh3 = t.get<"by_id">().extract(100);            // by key
+    CHECK(t.size() == 1 && nh3.value().id == 100);
+    nh3.value().id = 5;
+    CHECK(t.insert(std::move(nh3)).inserted);
+    CHECK(t.get<"by_id">().contains(5));
+    CHECK(t.get<"by_id">().extract(999).empty());        // missing key -> empty handle
+    auto nh4 = t.get<"by_id">().extract(t.get<"by_id">().find(5));   // by iterator
+    nh4.value().id = 100;
+    CHECK(t.insert(std::move(nh4)).inserted);
+    CHECK(t.get<"by_id">().contains(100));
+
     // failed reinsert returns the handle (node retained, not leaked)
     auto nh2 = t.extract(t.get<"by_id">().find(2));
     t.insert(Rec{2, "clash", "c", 0});       // take id 2
@@ -825,6 +838,148 @@ void test_moved_from_valid() {
     }
 }
 
+// ===========================================================================
+//  Features brought over from the EXAMPLES.md proposal.
+// ===========================================================================
+struct Person { int id; std::string dept; std::string name; int salary; };
+struct Boss   { std::string dept; std::string name; };
+
+void test_aliases() {
+    std::println("[cov] mic::multi_index / mic::pmr::multi_index aliases");
+    using A = mic::multi_index<Person, mic::indexed_by<mic::ordered_unique<"by_id", mic::key<&Person::id>>>>;
+    static_assert(std::is_same_v<A, mic::multi_index_container<Person, mic::indexed_by<mic::ordered_unique<"by_id", mic::key<&Person::id>>>>>);
+    A a; a.insert({1, "Eng", "Ada", 100}); CHECK(a.size() == 1);
+    using PA = mic::pmr::multi_index<Person, mic::indexed_by<mic::ordered_unique<"by_id", mic::key<&Person::id>>>>;
+    std::pmr::monotonic_buffer_resource pool;
+    PA p{&pool}; p.insert({1, "Eng", "Ada", 100}); CHECK(p.size() == 1);
+}
+
+void test_keyof_and_prefix() {
+    std::println("[cov] proxy.key_of, mic::prefix");
+    using T = mic::multi_index<Person, mic::indexed_by<
+        mic::ordered_non_unique<"by_dn", mic::key<&Person::dept, &Person::name>>>>;
+    T t;
+    t.insert({1, "Eng", "Ada", 0}); t.insert({2, "Eng", "Bjarne", 0}); t.insert({3, "Ops", "Cleo", 0});
+    auto dn = t.get<"by_dn">();
+    auto k = dn.key_of(*dn.begin());                 // tuple<string,string>
+    CHECK(std::get<0>(k) == "Eng" && std::get<1>(k) == "Ada");
+    auto [lo, hi] = dn.equal_range(mic::prefix(std::string("Eng")));
+    CHECK(std::distance(lo, hi) == 2);
+}
+
+void test_range_bounds() {
+    std::println("[cov] ordered range() with key_ge/gt/le/lt/unbounded");
+    using T = mic::multi_index<Person, mic::indexed_by<
+        mic::ordered_non_unique<"by_ds", mic::key<&Person::dept, &Person::salary>>>>;
+    T t;   // Person = { id, dept, name, salary }
+    t.insert({1, "Eng", "Dan", 140}); t.insert({2, "Eng", "Ada", 160});
+    t.insert({3, "Eng", "Bo", 180});  t.insert({4, "Eng", "Cy", 240});
+    t.insert({5, "Sales", "Ev", 120});
+    auto ds = t.get<"by_ds">();
+    CHECK(std::ranges::distance(ds.range(mic::key_ge(std::tuple{std::string("Eng"), 150}),
+                                         mic::key_le(mic::prefix(std::string("Eng"))))) == 3);   // 160,180,240
+    CHECK(std::ranges::distance(ds.range(mic::unbounded, mic::key_lt(std::tuple{std::string("Eng"), 180}))) == 2);
+    CHECK(std::ranges::distance(ds.range(mic::key_gt(std::tuple{std::string("Eng"), 160}), mic::unbounded)) == 3);
+    CHECK(std::ranges::distance(ds.range(mic::unbounded, mic::unbounded)) == 5);
+}
+
+void test_try_mutation() {
+    std::println("[cov] try_modify / try_replace / modify_key / on_collision::erase / try_emplace");
+    using T = mic::multi_index<Person, mic::indexed_by<
+        mic::ordered_unique    <"by_id",    mic::key<&Person::id>>,
+        mic::hashed_unique     <"by_name",  mic::key<&Person::name>>,
+        mic::ranked_non_unique <"by_salary",mic::key<&Person::salary>>>>;
+    T t; t.insert({1, "Eng", "Ada", 100}); t.insert({2, "Eng", "Bo", 200});
+    auto id = t.get<"by_id">();
+
+    auto r = id.try_modify(id.find(1), [](Person& p){ p.salary = 150; });
+    CHECK(r && (**r).salary == 150);
+    auto r2 = id.try_modify(id.find(1), [](Person& p){ p.name = "Bo"; });
+    CHECK(!r2 && r2.error().index_tag == "by_name" && r2.error().blocking->id == 2);
+    CHECK(id.find(1)->name == "Ada");                 // kept
+
+    t.get<"by_salary">().modify_key(t.get<"by_salary">().find(150), [](int& s){ s += 5; });
+    CHECK(id.find(1)->salary == 155);
+
+    bool ok = id.modify(id.find(1), [](Person& p){ p.name = "Bo"; }, mic::on_collision::erase);
+    CHECK(!ok && !id.contains(1) && t.size() == 1);    // dropped
+
+    auto rr = id.try_replace(id.find(2), Person{2, "Ops", "Bz", 9});
+    CHECK(rr && id.find(2)->dept == "Ops");
+    CHECK(!t.try_emplace(2, "x", "y", 0));             // dup id
+    CHECK(t.try_emplace(7, "z", "Zed", 0).has_value());
+}
+
+void test_format_specs() {
+    std::println("[cov] std::format specs: {{}}, stats, audit, full, index=");
+    struct E { int id; std::string name; };
+    using T = mic::multi_index<E, mic::indexed_by<
+        mic::ordered_unique<"by_id", mic::key<&E::id>>,
+        mic::hashed_unique <"by_name", mic::key<&E::name>>>>;
+    T t; t.insert({2, "b"}); t.insert({1, "a"});
+    CHECK(std::format("{}", t) == "multi_index(size=2)");
+    CHECK(std::format("{:stats}", t).find("by_name") != std::string::npos);
+    CHECK(std::format("{:audit}", t).find("OK") != std::string::npos);
+    // value_type E has no formatter -> {:full} reports that, not a compile error
+    CHECK(std::format("{:full}", t).find("not formattable") != std::string::npos);
+    auto s = t.stats();
+    CHECK(s.index<"by_id">().unique);
+    CHECK(s.index<"by_name">().kind == mic::index_kind::hashed);
+    CHECK(s.all().size() == 2);
+}
+
+void test_observers() {
+    std::println("[cov] observed container: subscribe / RAII token / fire on insert-erase-modify");
+    using T = mic::observed<Person, mic::indexed_by<mic::ordered_unique<"by_id", mic::key<&Person::id>>>>;
+    T t;
+    int ins = 0, ers = 0, mod = 0;
+    {
+        auto tok = t.subscribe({ .on_insert = [&](const Person&){ ++ins; },
+                                 .on_erase  = [&](const Person&){ ++ers; },
+                                 .on_modify = [&](const Person&){ ++mod; } });
+        t.insert({1, "Eng", "Ada", 0});
+        t.insert({2, "Eng", "Bo", 0});
+        t.get<"by_id">().modify(t.get<"by_id">().find(1), [](Person& p){ p.name = "A"; });
+        t.get<"by_id">().erase(t.get<"by_id">().find(2));
+    }
+    CHECK(ins == 2 && mod == 1 && ers == 1);
+    int before = ins;
+    t.insert({3, "Eng", "C", 0});                       // token gone -> silent
+    CHECK(ins == before);
+}
+
+#if MIC_HAS_GENERATOR
+void test_queries() {
+    std::println("[cov] mic::queries::equi_join + group_by");
+    using S = mic::multi_index<Person, mic::indexed_by<mic::ordered_non_unique<"by_dept", mic::key<&Person::dept>>>>;
+    using M = mic::multi_index<Boss,   mic::indexed_by<mic::ordered_non_unique<"by_dept", mic::key<&Boss::dept>>>>;
+    S s; s.insert({1, "Eng", "Ada", 0}); s.insert({2, "Eng", "Bo", 0}); s.insert({3, "Ops", "Cy", 0});
+    s.insert({4, "Research", "Dee", 0});                 // no boss
+    M m; m.insert({"Eng", "Mae"}); m.insert({"Eng", "Ned"}); m.insert({"Ops", "Ola"}); m.insert({"Sales", "Pat"});
+
+    int pairs = 0;
+    for (auto&& [p, b] : mic::queries::equi_join(s.get<"by_dept">(), m.get<"by_dept">())) { (void)p; (void)b; ++pairs; }
+    CHECK(pairs == 5);                                   // Eng 2x2=4 + Ops 1x1=1
+
+    std::vector<std::pair<std::string, std::ptrdiff_t>> groups;
+    for (auto&& [dept, grp] : mic::queries::group_by(s.get<"by_dept">()))
+        groups.emplace_back(dept, std::ranges::distance(grp));
+    CHECK((groups == std::vector<std::pair<std::string,std::ptrdiff_t>>{{"Eng",2},{"Ops",1},{"Research",1}}));
+}
+#endif
+
+void test_aggregate_key() {
+    std::println("[cov] aggregate-struct key via free-fn extractor + key_of decomposition");
+    struct DS { std::string dept; int salary; auto operator<=>(const DS&) const = default; };
+    struct fn { static DS of(const Person& p) { return {p.dept, p.salary}; } };
+    using T = mic::multi_index<Person, mic::indexed_by<mic::ordered_non_unique<"by_ds", mic::global_fun<Person, DS, &fn::of>>>>;
+    T t; t.insert({1, "Eng", "Ada", 180}); t.insert({2, "Ops", "Bo", 200});
+    auto f = t.get<"by_ds">().find(DS{.dept = "Eng", .salary = 180});
+    CHECK(f != t.get<"by_ds">().end());
+    auto [dept, salary] = t.get<"by_ds">().key_of(*f);
+    CHECK(dept == "Eng" && salary == 180);
+}
+
 } // namespace
 
 int main() {
@@ -855,6 +1010,16 @@ int main() {
     test_inline_key_boundary();
     test_differential_ordered();
     test_const_element_safety();
+    test_aliases();
+    test_keyof_and_prefix();
+    test_range_bounds();
+    test_try_mutation();
+    test_format_specs();
+    test_observers();
+#if MIC_HAS_GENERATOR
+    test_queries();
+#endif
+    test_aggregate_key();
 
     std::println("\n[coverage] {}/{} checks passed", g_checks - g_fail, g_checks);
     return g_fail == 0 ? 0 : 1;

@@ -1,22 +1,21 @@
-# Multi-Index Container — Proposed Usage Examples
+# Multi-Index Container — Usage Examples
 
-> **Status:** this is the original *design proposal*. The shipped v1 API follows
-> it closely; where they differ (e.g. `erase(key)` is spelled `erase_key`,
-> `get<"tag">()` returns a proxy **by value** so bind with `auto` not `auto&`,
-> hashed lookup materialises the key), the source of truth is
+> **Status:** this began as a design proposal and is now **almost entirely
+> implemented**. Nearly every snippet below compiles and runs against the shipped
+> header; the runnable programs in [`examples/`](examples) exercise the same APIs.
+> Where a detail differs from the original sketch (e.g. `get<"tag">()` returns a
+> proxy **by value** so bind with `auto`, not `auto&`), the snippet has been
+> updated to the real API. The only two features kept as *future work* are the
+> fixed-capacity `static_multi_index` (§10b) and fully `constexpr` tables (§13) —
+> both incompatible with the single-allocation intrusive design; close
+> equivalents are noted inline. The source of truth is always
 > [`README.md`](README.md) and the compiled programs under [`examples/`](examples).
->
-> These pin the public API surface. Every name (`mic`, `multi_index`, `indexed_by`,
-> `key`, `get<"tag">`, `try_insert`, etc.) is a decision to ratify. Defaults shown
-> follow the spec's recommendations: **enforced string-literal tags**, **by-tag access
-> only**, **`std::expected` alongside classic returns**, **transparent lookup**, and
-> **rollback-and-keep `modify`**.
 
 All examples assume:
 
 ```cpp
-import multi_index;          // or: #include <mic/multi_index.hpp>
-namespace mic = multi_index; // assumed short alias used throughout
+#include <mic/multi_index.hpp>   // header-only
+// mic::multi_index<...> is a short alias for mic::multi_index_container<...>
 ```
 
 ---
@@ -115,20 +114,23 @@ bool ok2 = staff.get<"by_id">().modify(it, [](Employee& e){ e.email = "ada@x.io"
 assert(!ok2);                 // collided with Ada
 assert(it->email != "ada@x.io"); // element preserved, not erased
 
-// modify_key: hand the mutator only the key (requires a writable extractor).
+// modify_key: hand the mutator only the (writable) key. Works where the index
+// key is a plain data member; computed/composite keys use modify() instead.
 staff.get<"by_salary">().modify_key(it, [](int& s){ s += 5'000; });
 
 // replace: whole-element swap, strong guarantee, position stable.
 Employee updated = *it; updated.dept = "Platform";
 bool ok3 = staff.get<"by_id">().replace(it, updated);
 
-// expected variant names what blocked a rollback:
+// expected variants name what blocked a rollback (insert_error<Employee> fields,
+// same as try_insert): try_modify / try_replace / try_emplace.
 auto rr = staff.get<"by_id">().try_modify(it, [](Employee& e){ e.email = "ada@x.io"; });
-if (!rr) std::println("blocked by '{}'", rr.error().index_tag());
+if (!rr) std::println("blocked by '{}', conflicts with id {}",
+                      rr.error().index_tag, rr.error().blocking->id);
 ```
 
-**Decision to confirm:** default is **rollback-and-keep**. Opt into Boost's legacy
-erase-on-failure per call with `staff.get<"by_id">().modify(it, fn, mic::on_collision::erase)`.
+**Default is rollback-and-keep.** Opt into Boost's legacy erase-on-failure per call
+with `staff.get<"by_id">().modify(it, fn, mic::on_collision::erase)`.
 
 ---
 
@@ -145,31 +147,35 @@ auto [lo, hi] = staff.get<"by_dept_salary">().equal_range(std::tuple{"Eng", 180'
 // prefix (partial-key) query — first component only, still O(log n):
 auto eng = staff.get<"by_dept_salary">().equal_range(mic::prefix("Eng"));
 
-// open range on the trailing component:
+// open / half-open range with mic::key_ge/key_gt/key_le/key_lt and mic::unbounded.
+// Here: Eng employees earning >= 150k, up to the end of the Eng group.
 auto well_paid_eng = staff.get<"by_dept_salary">()
         .range(mic::key_ge(std::tuple{"Eng", 150'000}),
-               mic::key_lt(std::tuple{"Eng", mic::unbounded}));
+               mic::key_le(mic::prefix("Eng")));
+// other forms: range(mic::unbounded, mic::key_lt(k)) / range(mic::key_gt(k), mic::unbounded)
 ```
 
 ```cpp
-// (b) Aggregate-struct key: operator<=> auto-derives the comparator,
-//     designated initialisers build the query, structured bindings read it back.
+// (b) Aggregate-struct key: operator<=> auto-derives the comparator, designated
+//     initialisers build the query, structured bindings read it back. The
+//     extractor is a free function (key<&fn>) — closures aren't usable as the
+//     NTTP here because their result type can't be deduced without the element.
 struct DeptSalary {
     std::string dept;
     int         salary;
     auto operator<=>(const DeptSalary&) const = default;
 };
+DeptSalary ds_of(const Employee& e) { return {e.dept, e.salary}; }
 
-using ByDS = mic::ordered_non_unique<"by_ds",
-                  mic::key<[](const Employee& e){ return DeptSalary{e.dept, e.salary}; }>>;
+using ByDS = mic::ordered_non_unique<"by_ds", mic::key<&ds_of>>;
 
-auto f = table.get<"by_ds">().find({.dept = "Eng", .salary = 180'000});
-auto&& [dept, salary] = mic::key_of(*f);   // structured-binding decomposition
+auto f = staff.get<"by_ds">().find({.dept = "Eng", .salary = 180'000});
+auto&& [dept, salary] = staff.get<"by_ds">().key_of(*f);   // structured-binding decomposition
 ```
 
-**Decision:** hashed composite keys are **full-key only** — `prefix(...)`/`range(...)`
-must not compile on a hashed index. Lambda extractors are allowed wherever a member
-pointer is (`key<lambda>`).
+**Notes:** hashed composite keys are **full-key only** — `prefix(...)`/`range(...)`
+need ordering and so are ordered-index only. `proxy.key_of(elem)` re-extracts an
+element's key for that index (used above, and by the relational helpers in §12).
 
 ---
 
@@ -182,9 +188,10 @@ auto top3 = staff.get<"by_salary">()
           | std::views::take(3);
 for (const Employee& e : top3) std::println("{}: {}", e.name, e.salary);
 
-// equal_range as a subrange:
-for (const Employee& e : std::ranges::equal_range(staff.get<"by_name">(), "Ada"))
-    std::println("{}", e.email);
+// equal_range as a subrange (member form; or std::ranges::equal_range with a
+// projection: std::ranges::equal_range(idx, "Ada", {}, &Employee::name)):
+auto [lo, hi] = staff.get<"by_name">().equal_range("Ada");
+for (auto it = lo; it != hi; ++it) std::println("{}", it->email);
 
 // Build a container straight from a range:
 std::vector<Employee> seed = load();
@@ -262,8 +269,8 @@ bids.insert(Order{.id = 3, .side = 'B', .price = 10'050, .ts = 1, .qty = 10});
 // Best bid = highest price, earliest time = last in ascending (price,ts) order.
 const Order& best = *std::prev(bids.get<"by_px_time">().end());
 
-// Cancel by id in O(1) avg:
-bids.get<"by_id">().erase(2);
+// Cancel by id in O(1) avg (erase by key is spelled erase_key):
+bids.get<"by_id">().erase_key(2);
 
 // Partial fill: modify qty in place (no key changes -> cheap, no repositioning).
 auto it = bids.get<"by_id">().find(1);
@@ -291,7 +298,7 @@ auto seqIt = staff.project<"by_arrival">(h);
 
 ```cpp
 // extract() detaches a node from ALL indices without deallocating.
-auto node = staff.get<"by_id">().extract(1);
+auto node = staff.get<"by_id">().extract(1);   // by key (or .extract(iterator))
 node.value().id = 1000;            // mutate a key safely while detached
 auto res = staff.insert(std::move(node)); // re-link across all indices
 if (!res.inserted) {
@@ -327,8 +334,11 @@ if (!r && r.error().why == mic::insert_error<Employee>::reason::capacity_exceede
 
 ## 11. Formatting & introspection (`std::format`)
 
+Implemented; see [`examples/observed_table.cpp`](examples/observed_table.cpp).
+`{:full}` / `{:index=tag}` need a formattable `value_type`; the others always work.
+
 ```cpp
-std::println("{}", staff);                 // summary: type + per-index sizes
+std::println("{}", staff);                 // summary: multi_index(size=N)
 std::println("{:full}", staff);            // every element (needs formattable Employee)
 std::println("{:index=by_salary}", staff); // dump in by_salary order
 std::println("{:stats}", staff);           // load factors, collisions, hash_quality()
@@ -340,10 +350,13 @@ std::println("by_email load = {:.2f}", s.index<"by_email">().load_factor);
 
 ---
 
-## 12. Coroutine query helpers
+## 12. Relational query helpers (lazy, `std::generator`)
+
+Implemented (sort-merge join + grouping over ordered indices, both already sorted
+on their key). Runnable: [`examples/relational_queries.cpp`](examples/relational_queries.cpp).
 
 ```cpp
-// Lazy SQL-ish joins/grouping returning std::generator<const T&> — O(1) space.
+// Lazy SQL-ish INNER JOIN / GROUP BY returning std::generator — O(n+m), O(1) space.
 for (auto&& [emp, mgr] :
         mic::queries::equi_join(staff.get<"by_dept">(),
                                 managers.get<"by_dept">()))
@@ -357,7 +370,13 @@ for (auto&& [dept, group] : mic::queries::group_by(staff.get<"by_dept">()))
 
 ---
 
-## 13. Compile-time tables (`constexpr`)
+## 13. Compile-time tables (`constexpr`) — *future work*
+
+**Not supported in v1.** The single-allocation intrusive design relies on runtime
+pointer manipulation that isn't valid in a constant expression, so a `mic` container
+can't yet be built at compile time. The close equivalent today is a `constexpr`
+sorted `std::array` with `std::ranges::lower_bound` for the lookup. The sketch below
+is the intended shape if a constexpr-friendly storage backend is added later.
 
 ```cpp
 consteval auto build_keywords() {
@@ -376,15 +395,20 @@ static_assert(KEYWORDS.get<"by_word">().contains("while"));
 
 ## 14. Observers (opt-in, zero-overhead when absent)
 
+Use the `mic::observed<...>` alias to opt in; `subscribe(...)` takes a callback set
+(any subset, designated initialisers) and returns an RAII token. Observation stops
+when the token is destroyed. A plain `mic::multi_index` has no `subscribe()` and
+pays nothing. Runnable: [`examples/observed_table.cpp`](examples/observed_table.cpp).
+
 ```cpp
-using AuditedTable = mic::multi_index<Employee,
-    mic::indexed_by</*...*/>,
-    mic::observers<mic::on_insert, mic::on_erase, mic::on_modify>>;
+using AuditedTable = mic::observed<Employee,
+    mic::indexed_by<mic::ordered_unique<"by_id", mic::key<&Employee::id>>>>;
 
 AuditedTable t;
 auto token = t.subscribe({
     .on_insert = [](const Employee& e){ log("hired {}", e.name); },
     .on_erase  = [](const Employee& e){ log("left {}",  e.name); },
+    .on_modify = [](const Employee& e){ log("changed {}", e.name); },
 });
 // token is an RAII handle — observation stops when it goes out of scope.
 ```
