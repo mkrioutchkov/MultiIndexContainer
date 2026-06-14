@@ -5,10 +5,10 @@
 > header; the runnable programs in [`examples/`](examples) exercise the same APIs.
 > Where a detail differs from the original sketch (e.g. `get<"tag">()` returns a
 > proxy **by value** so bind with `auto`, not `auto&`), the snippet has been
-> updated to the real API. The only two features kept as *future work* are the
-> fixed-capacity `static_multi_index` (§10b) and fully `constexpr` tables (§13) —
-> both incompatible with the single-allocation intrusive design; close
-> equivalents are noted inline. The source of truth is always
+> updated to the real API. The **one** feature kept as *future work* is fully
+> `constexpr` tables (§13) — incompatible with the intrusive pointer design; a
+> working close equivalent is shown inline. (`static_multi_index`, §10b, is now
+> implemented as an inline-arena container.) The source of truth is always
 > [`README.md`](README.md) and the compiled programs under [`examples/`](examples).
 
 All examples assume:
@@ -116,7 +116,9 @@ assert(it->email != "ada@x.io"); // element preserved, not erased
 
 // modify_key: hand the mutator only the (writable) key. Works where the index
 // key is a plain data member; computed/composite keys use modify() instead.
-staff.get<"by_salary">().modify_key(it, [](int& s){ s += 5'000; });
+// Call it through the index that OWNS the key (by_salary); project<>() jumps the
+// by_id iterator across to a by_salary one.
+staff.get<"by_salary">().modify_key(staff.project<"by_salary">(it), [](int& s){ s += 5'000; });
 
 // replace: whole-element swap, strong guarantee, position stable.
 Employee updated = *it; updated.dept = "Platform";
@@ -223,7 +225,7 @@ public:
     explicit LruCache(std::size_t cap) : cap_(cap) {}
 
     Val* get(const Key& k) {
-        auto& byKey = store_.get<"by_key">();
+        auto byKey = store_.get<"by_key">();   // get<>() returns the proxy by value
         auto it = byKey.find(k);
         if (it == byKey.end()) return nullptr;
         // promote: O(1) splice to front via projection — no re-hash, no copy.
@@ -320,14 +322,16 @@ std::array<std::byte, 1 << 20> arena;
 std::pmr::monotonic_buffer_resource res{arena.data(), arena.size()};
 mic::pmr::multi_index<Employee, mic::indexed_by</*...*/>> fast{&res};
 
-// (b) static_multi_index — bounded capacity, zero heap, constexpr-friendly.
-//     PLANNED — not in v1. Sketch of the intended shape; `capacity_exceeded`
-//     would join `insert_error<Employee>::reason` once a fixed variant ships.
+// (b) static_multi_index — inline-arena storage, NO heap allocation. Every node
+//     and index structure comes from a buffer embedded in the object; it holds
+//     at least N elements. try_insert / try_emplace report capacity_exceeded
+//     (instead of throwing) once the arena is full. Best for build-mostly-once
+//     tables — the arena reclaims nothing until the container is destroyed.
 using Fixed = mic::static_multi_index<Employee, /*N=*/64,
     mic::indexed_by<mic::ordered_unique<"by_id", mic::key<&Employee::id>>>>;
 Fixed embedded;
 auto r = embedded.try_insert(Employee{/*...*/});
-if (!r && r.error().why == mic::insert_error<Employee>::reason::capacity_exceeded) { /*...*/ }
+if (!r && r.error().why == mic::insert_error<Employee>::reason::capacity_exceeded) { /* full */ }
 ```
 
 ---
@@ -374,11 +378,11 @@ for (auto&& [dept, group] : mic::queries::group_by(staff.get<"by_dept">()))
 
 **Not supported in v1.** The single-allocation intrusive design relies on runtime
 pointer manipulation that isn't valid in a constant expression, so a `mic` container
-can't yet be built at compile time. The close equivalent today is a `constexpr`
-sorted `std::array` with `std::ranges::lower_bound` for the lookup. The sketch below
-is the intended shape if a constexpr-friendly storage backend is added later.
+can't be built at compile time. The sketch below is the intended shape *if* a
+constexpr-friendly storage backend is ever added:
 
 ```cpp
+// FUTURE WORK — does not compile today.
 consteval auto build_keywords() {
     mic::multi_index<std::pair<std::string_view,int>,
         mic::indexed_by<mic::ordered_unique<"by_word",
@@ -388,7 +392,23 @@ consteval auto build_keywords() {
 }
 constexpr auto KEYWORDS = build_keywords();
 static_assert(KEYWORDS.get<"by_word">().contains("while"));
-// NOTE: ordered/sequenced/random_access are constexpr-usable; hashed is NOT.
+```
+
+The **working close equivalent today** is a `constexpr` sorted `std::array` with a
+binary search — exactly the lookup an ordered index would do, just evaluated at
+compile time:
+
+```cpp
+struct KW { std::string_view word; int id; };
+constexpr std::array KEYWORDS = std::to_array<KW>({   // keep sorted by word
+    {"else", 2}, {"if", 1}, {"while", 3} });
+
+constexpr const KW* find_kw(std::string_view w) {
+    auto it = std::ranges::lower_bound(KEYWORDS, w, {}, &KW::word);
+    return (it != KEYWORDS.end() && it->word == w) ? &*it : nullptr;
+}
+static_assert(find_kw("while") && find_kw("while")->id == 3);
+static_assert(find_kw("switch") == nullptr);
 ```
 
 ---
