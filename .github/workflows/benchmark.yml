@@ -29,6 +29,8 @@ jobs:
         run: |
           g++-14 -std=c++23 -O2 -I include tests/test_main.cpp tests/test_tu2.cpp -o run_tests
           ./run_tests
+          g++-14 -std=c++23 -O2 -I include tests/test_coverage.cpp -o run_coverage
+          ./run_coverage
       - name: Build and run examples
         run: |
           set -e
