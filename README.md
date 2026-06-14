@@ -70,6 +70,10 @@ for (const Employee& e : s.get<"by_salary">() | std::views::reverse) { /* high�
   allocation (element nodes **and** all per-index structures) through one
   `std::pmr::memory_resource`, so a pool / `monotonic_buffer_resource` serves the
   whole container.
+* **Zero-heap option** — `mic::static_multi_index<T, N, …>` is a fixed-capacity
+  variant whose nodes and index structures live in an arena embedded in the
+  object: **no heap allocation at all**. `try_insert` / `try_emplace` report
+  `insert_error::capacity_exceeded` when the arena fills.
 * **Modern API** — `std::expected`-returning `try_insert` / `try_emplace` /
   `try_modify` / `try_replace` whose `insert_error` names *which* unique index
   rejected the change (by tag) **and** points at the blocking element — a
@@ -89,46 +93,139 @@ for (const Employee& e : s.get<"by_salary">() | std::views::reverse) { /* high�
 * **`mic::modify_key` / `on_collision::erase`** — edit just the key, and opt into
   Boost's legacy erase-on-collision per call.
 
-## Examples at a glance
+## Cookbook
 
-Each snippet uses the real, verified API (with `Staff s;` from the example above);
-complete, compiled programs live in [`examples/`](examples).
+Eight things you can build in a handful of lines. The code in every recipe below
+was **compiled and run** before being pasted here (shown as excerpts — the
+container types, key types and showcase calls are real and verified). Full
+programs live in [`examples/`](examples), and [`EXAMPLES.md`](EXAMPLES.md) is the
+annotated tour.
+
+### Which index rejected my insert? — a diagnostic Boost can't give you
+
+`try_insert` returns a `std::expected`; on failure it names *which* unique index
+objected and hands you a pointer to the element you collided with.
 
 ```cpp
-// Which index rejected an insert? (a diagnostic Boost doesn't surface)
-if (auto r = s.try_insert(dup); !r)
-    std::println("rejected by '{}', conflicts with id {}", r.error().index_tag, r.error().blocking->id);
+using Users = mic::multi_index<User, mic::indexed_by<
+    mic::ordered_unique<"by_id",       mic::key<&User::id>>,
+    mic::hashed_unique <"by_username", mic::key<&User::username>>,
+    mic::hashed_unique <"by_email",    mic::key<&User::email>>>>;
+
+if (auto r = users.try_insert({3, "alice", "new@x.io"}); !r)   // username "alice" taken
+    std::println("rejected by '{}' — clashes with id {}",
+                 r.error().index_tag, r.error().blocking->id);
+// → rejected by 'by_username' — clashes with id 1
 ```
+
+### Leaderboard — top-N and "what's my rank?" in O(log n)
+
+A `ranked_non_unique` index is an order-statistics tree: top-N by reversing,
+absolute rank via `rank()`, the median via `nth()` — no sorting, all O(log n).
+
 ```cpp
-// Open-ended range scan: everyone earning [150k, 200k)
-for (const Employee& e : s.get<"by_salary">().range(mic::key_ge(150'000), mic::key_lt(200'000)))
-    use(e);
+using Board = mic::multi_index<Player, mic::indexed_by<
+    mic::ranked_non_unique<"by_score", mic::key<&Player::score>>,
+    mic::ordered_unique   <"by_id",    mic::key<&Player::id>>>>;
+auto board = b.get<"by_score">();
+
+for (const Player& p : board | std::views::reverse | std::views::take(3))   // top 3
+    std::println("{:>6} {}", p.score, p.name);
+
+auto me = b.project<"by_score">(b.get<"by_id">().find(myId));               // jump index
+std::println("you are #{} of {}", b.size() - board.rank(me), b.size());    // O(log n)
+std::println("median: {}", board.nth(b.size() / 2)->score);
 ```
+
+### SQL in C++ — lazy `INNER JOIN` and `GROUP BY`
+
+`mic::queries` join/group two ordered indices with a sort-merge `std::generator`
+— O(n + m), zero intermediate storage.
+
 ```cpp
-// Relational helpers (lazy std::generator): INNER JOIN + GROUP BY
-for (auto&& [emp, mgr] : mic::queries::equi_join(s.get<"by_dept">(), managers.get<"by_dept">()))
+#if MIC_HAS_GENERATOR
+for (auto&& [emp, mgr] : mic::queries::equi_join(emps.get<"by_dept">(), mgrs.get<"by_dept">()))
     std::println("{} reports to {}", emp.name, mgr.name);
-for (auto&& [dept, group] : mic::queries::group_by(s.get<"by_dept">()))
-    std::println("{}: {}", dept, std::ranges::distance(group));
-```
-```cpp
-// Join on a key prefix (table on K  ⋈  table on (K, …)) — composite equal_range
-for (const Quota& q : quotas.get<"by_region">()) {
-    auto [lo, hi] = sales.get<"by_region_cat">().equal_range(mic::prefix(q.region));
-    for (auto it = lo; it != hi; ++it) join(q, *it);
-}
-```
-```cpp
-// Lifecycle observers: an RAII subscription
-auto token = s2.subscribe({ .on_insert = [](const Employee& e){ log("hired", e.name); } });
-```
-```cpp
-// std::format introspection
-std::println("{:stats}", s);                                  // per-index kinds + load factors
-auto lf = s.stats().index<"by_email">().load_factor;          // structured access
+
+for (auto&& [dept, team] : mic::queries::group_by(emps.get<"by_dept">()))
+    std::println("{}: {} people", dept, std::ranges::distance(team));
+#endif
+// Ada reports to Grace / Bo reports to Grace / Cy reports to Ivan
+// Eng: 2 people / Sales: 1 people
 ```
 
-See [`EXAMPLES.md`](EXAMPLES.md) for the annotated, section-by-section tour.
+### Price-time-priority order book — one composite key does it all
+
+`key<&Order::price, &Order::ts>` sorts by price then time; the best bid is just
+the last element, and a parallel hashed index cancels by id in O(1).
+
+```cpp
+using Book = mic::multi_index<Order, mic::indexed_by<
+    mic::hashed_unique     <"by_id",    mic::key<&Order::id>>,
+    mic::ordered_non_unique<"by_px_ts", mic::key<&Order::price, &Order::ts>>>>;
+
+const Order& best = *std::prev(book.get<"by_px_ts">().end());   // top price, earliest ts
+book.get<"by_id">().erase_key(2);                                // O(1) cancel by id
+```
+
+### Range & prefix scans on a composite key
+
+One ordered `(dept, salary)` index answers whole-department, salary-band, and
+open-ended queries — with `key_ge` / `key_lt` / `key_le`, `unbounded`, and `prefix`.
+
+```cpp
+auto by_ds = staff.get<"by_dept_salary">();
+
+by_ds.equal_range(mic::prefix("Eng"));                                  // whole department
+by_ds.range(mic::key_ge(std::tuple{"Eng", 95'000}),                     // Eng earning ≥ 95k,
+            mic::key_le(mic::prefix("Eng")));                           //   up to end of Eng
+by_ds.range(mic::unbounded, mic::key_lt(std::tuple{"Mkt", 80'000}));    // open lower bound
+```
+
+### Lifecycle observers — a one-liner audit log
+
+Opt into `mic::observed<...>` and `subscribe(...)` returns an RAII token. Costs
+nothing until you subscribe; a plain `mic::multi_index` has no `subscribe()` at all.
+
+```cpp
+using Audited = mic::observed<Account, mic::indexed_by<
+    mic::ordered_unique<"by_id", mic::key<&Account::id>>>>;
+
+auto token = db.subscribe({
+    .on_insert = [](const Account& a){ log("opened {}", a.owner); },
+    .on_erase  = [](const Account& a){ log("closed {}", a.owner); },
+});
+db.insert({1, "Ada"});      // fires on_insert; drop `token` to stop observing
+```
+
+### A `std::format` dashboard
+
+Format specs turn a live table into instant observability — and `stats()` exposes
+the same numbers structurally.
+
+```cpp
+std::println("{:stats}", tbl);            // per-index kind / uniqueness / hashed load factor
+std::println("{:audit}", tbl);            // invariant check across all indices
+std::println("{:index=by_price}", tbl);   // dump elements cheapest → dearest
+float lf = tbl.stats().index<"by_symbol">().load_factor;   // structured read
+```
+
+### Zero-heap storage (embedded-friendly)
+
+`static_multi_index` keeps the entire container in an arena embedded in the object
+— no heap, ever — and reports `capacity_exceeded` when full. Or pool a normal
+container in a stack buffer with `pmr`.
+
+```cpp
+mic::static_multi_index<Sensor, 256, Indices> box;          // inline arena, no heap
+if (auto r = box.try_emplace(id, reading);
+        !r && r.error().why == mic::insert_error<Sensor>::reason::capacity_exceeded)
+    drop_oldest();
+
+std::array<std::byte, 64 * 1024> buf;                       // ...or a stack-buffer pool
+std::pmr::monotonic_buffer_resource arena{buf.data(), buf.size()};
+mic::pmr::multi_index<Sensor, Indices> pooled{&arena};
+```
 
 ## Key safety with pointer elements
 
@@ -197,8 +294,10 @@ flags, allocation profiling, and `perf` / VTune / Google Benchmark workflows.
   an insert), [composite keys](examples/composite_keys.cpp) (full + prefix
   lookups), a [modern-API tour](examples/modern_api.cpp),
   [relational queries](examples/relational_queries.cpp) (`equi_join` / `group_by`
-  / range scans), and an [observed table](examples/observed_table.cpp)
-  (lifecycle observers + `std::format` introspection).
+  / range scans), an [observed table](examples/observed_table.cpp) (lifecycle
+  observers + `std::format` introspection), a
+  [leaderboard](examples/leaderboard.cpp) (O(log n) rank / nth / median), and a
+  [zero-heap static table](examples/static_table.cpp) (inline arena + `pmr`).
 * [`playground/`](playground) — a Visual Studio project; open the `.sln`, press F5.
 
 ## Status & v1 limitations
@@ -215,9 +314,12 @@ Known limitations, slated for later work:
 * **Single-allocation:** all index kinds are intrusive (ordered/ranked AVL,
   hashed table, sequenced list) — one allocation per element, like Boost. Only
   random-access adds a pointer vector (so does Boost). `mic::pmr::multi_index_container`
-  pools the element nodes + the hashed bucket / random-access arrays.
-* Not yet implemented: serialization, the concurrent variants, and coroutine
-  query helpers.
+  pools the element nodes + the hashed bucket / random-access arrays, and
+  `mic::static_multi_index<T, N, …>` serves them all from an inline arena (no heap).
+* **`constexpr` containers** aren't supported (the intrusive pointer design isn't
+  constant-evaluable); see [`EXAMPLES.md` §13](EXAMPLES.md) for the idiomatic
+  compile-time alternative.
+* Not yet implemented: serialization and concurrent variants.
 
 Internally each element lives in one stable node threaded into every index, so
 iterators, pointers and references stay valid until the element is erased.
