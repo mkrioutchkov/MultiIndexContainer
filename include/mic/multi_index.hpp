@@ -337,11 +337,14 @@ namespace detail {
 
 // Intrusive tree linkage stored inside the element node (one per ordered/ranked
 // index). No separate allocation: the index lives in the node it indexes.
-template <class NodePtr>
+template <class NodePtr, class KeyType, bool InlineKey>
 struct tree_hook {
     NodePtr      l = nullptr, r = nullptr, up = nullptr;
     std::size_t  sz     = 1;   // subtree size  -> O(log n) nth()/rank()
     std::int32_t height = 1;   // AVL height    -> balanced, std::set-class find
+    // A small trivially-copyable key is cached next to the links, so a comparison
+    // reads it from the same cache line instead of chasing node->value.
+    MIC_NO_UNIQUE_ADDRESS std::conditional_t<InlineKey, KeyType, std::monostate> key{};
 };
 
 // Size-augmented AVL tree whose links live in std::get<I>(node->hooks). Backs
@@ -349,9 +352,16 @@ struct tree_hook {
 // balanced like std::set, so lookups do ~log2(n) comparisons. Comparisons
 // re-extract the key from the node's co-located value (Compare is transparent
 // over NodePtr / lookup keys).
-template <std::size_t I, class NodePtr, class Compare, bool Unique>
+template <std::size_t I, class NodePtr, class Extractor, class Compare, class KeyType, bool InlineKey, bool Unique>
 class intrusive_tree {
-    static tree_hook<NodePtr>& H(NodePtr p) { return std::get<I>(p->hooks); }
+    static tree_hook<NodePtr, KeyType, InlineKey>& H(NodePtr p) { return std::get<I>(p->hooks); }
+    template <class T> static decltype(auto) kx(const T& t) {           // key used for comparison
+        if constexpr (std::is_same_v<std::remove_cvref_t<T>, NodePtr>) {
+            if constexpr (InlineKey) return (H(t).key);                 // cached, co-located with links
+            else return Extractor{}((*t).value);                        // re-extract from co-located value
+        } else return (t);                                             // bare lookup key
+    }
+    template <class A, class B> static bool less(const A& a, const B& b) { return Compare{}(kx(a), kx(b)); }
     static std::size_t  S(NodePtr p)  { return p ? H(p).sz : 0; }
     static std::int32_t Ht(NodePtr p) { return p ? H(p).height : 0; }
     static std::int32_t bf(NodePtr p) { return Ht(H(p).l) - Ht(H(p).r); }
@@ -396,19 +406,18 @@ class intrusive_tree {
     }
     template <class K> NodePtr lb(const K& k) const {
         NodePtr t = root_, res = nullptr;
-        while (t) { if (Compare{}(t, k)) t = H(t).r; else { res = t; t = H(t).l; } }
+        while (t) { if (less(t, k)) t = H(t).r; else { res = t; t = H(t).l; } }
         return res;
     }
     template <class K> NodePtr ub(const K& k) const {
         NodePtr t = root_, res = nullptr;
-        while (t) { if (Compare{}(k, t)) { res = t; t = H(t).l; } else t = H(t).r; }
+        while (t) { if (less(k, t)) { res = t; t = H(t).l; } else t = H(t).r; }
         return res;
     }
-    void avl_insert(NodePtr nn) {
-        H(nn) = tree_hook<NodePtr>{};
+    void avl_insert(NodePtr nn) {   // nn's hook is already initialised (key cached) by try_add
         if (!root_) { root_ = nn; ++n_; return; }
         NodePtr t = root_, par = nullptr; bool left = false;
-        while (t) { par = t; if (Compare{}(nn, t)) { left = true; t = H(t).l; } else { left = false; t = H(t).r; } }
+        while (t) { par = t; if (less(nn, t)) { left = true; t = H(t).l; } else { left = false; t = H(t).r; } }
         H(nn).up = par; (left ? H(par).l : H(par).r) = nn; ++n_;
         fixup(par);
     }
@@ -468,7 +477,7 @@ public:
     template <class K> iterator upper_bound(const K& k) const { return { this, ub(k) }; }
     template <class K> iterator find(const K& k) const {
         NodePtr t = lb(k);
-        return (t && !Compare{}(k, t)) ? iterator{ this, t } : end();
+        return (t && !less(k, t)) ? iterator{ this, t } : end();
     }
     template <class K> std::pair<iterator, iterator> equal_range(const K& k) const { return { lower_bound(k), upper_bound(k) }; }
     template <class K> std::size_t count(const K& k) const {
@@ -487,9 +496,11 @@ public:
         return r;
     }
     bool try_add(NodePtr p, NodePtr& conflict) {
+        H(p) = tree_hook<NodePtr, KeyType, InlineKey>{};            // init hook + cache key BEFORE
+        if constexpr (InlineKey) H(p).key = Extractor{}((*p).value); // the unique check uses it
         if constexpr (Unique) {
             NodePtr e = lb(p);
-            if (e && !Compare{}(p, e)) { conflict = e; return false; }
+            if (e && !less(p, e)) { conflict = e; return false; }
         }
         avl_insert(p);
         return true;
@@ -502,19 +513,16 @@ struct tree_core {
     static constexpr index_kind kind = index_kind::ordered;
     using key_type = std::remove_cvref_t<typename Extractor::result_type>;
 
+    // Cache the key inline in the tree hook when it is small and trivially
+    // copyable (e.g. an int id); string/large keys re-extract from the value.
+    static constexpr bool inline_key =
+        std::is_trivially_copyable_v<key_type> && std::is_default_constructible_v<key_type> && sizeof(key_type) <= 16;
+
     template <class V> static key_type extract_key(const V& v) { return Extractor{}(v); }
     static bool keys_equal(const key_type& a, const key_type& b) { return !Compare{}(a, b) && !Compare{}(b, a); }
 
-    struct node_compare {
-        using is_transparent = void;
-        template <class T> static decltype(auto) kof(const T& t) {
-            if constexpr (std::is_same_v<std::remove_cvref_t<T>, NodePtr>) return Extractor{}((*t).value);
-            else return (t);
-        }
-        template <class A, class B> bool operator()(const A& a, const B& b) const { return Compare{}(kof(a), kof(b)); }
-    };
-    using container = intrusive_tree<I, NodePtr, node_compare, Unique>;
-    using hook_type = tree_hook<NodePtr>;
+    using container = intrusive_tree<I, NodePtr, Extractor, Compare, key_type, inline_key, Unique>;
+    using hook_type = tree_hook<NodePtr, key_type, inline_key>;
     container c;
     tree_core() = default;
     explicit tree_core(const Alloc&) {}   // intrusive: no allocation
