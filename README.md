@@ -89,6 +89,47 @@ for (const Employee& e : s.get<"by_salary">() | std::views::reverse) { /* high�
 * **`mic::modify_key` / `on_collision::erase`** — edit just the key, and opt into
   Boost's legacy erase-on-collision per call.
 
+## Examples at a glance
+
+Each snippet uses the real, verified API (with `Staff s;` from the example above);
+complete, compiled programs live in [`examples/`](examples).
+
+```cpp
+// Which index rejected an insert? (a diagnostic Boost doesn't surface)
+if (auto r = s.try_insert(dup); !r)
+    std::println("rejected by '{}', conflicts with id {}", r.error().index_tag, r.error().blocking->id);
+```
+```cpp
+// Open-ended range scan: everyone earning [150k, 200k)
+for (const Employee& e : s.get<"by_salary">().range(mic::key_ge(150'000), mic::key_lt(200'000)))
+    use(e);
+```
+```cpp
+// Relational helpers (lazy std::generator): INNER JOIN + GROUP BY
+for (auto&& [emp, mgr] : mic::queries::equi_join(s.get<"by_dept">(), managers.get<"by_dept">()))
+    std::println("{} reports to {}", emp.name, mgr.name);
+for (auto&& [dept, group] : mic::queries::group_by(s.get<"by_dept">()))
+    std::println("{}: {}", dept, std::ranges::distance(group));
+```
+```cpp
+// Join on a key prefix (table on K  ⋈  table on (K, …)) — composite equal_range
+for (const Quota& q : quotas.get<"by_region">()) {
+    auto [lo, hi] = sales.get<"by_region_cat">().equal_range(mic::prefix(q.region));
+    for (auto it = lo; it != hi; ++it) join(q, *it);
+}
+```
+```cpp
+// Lifecycle observers: an RAII subscription
+auto token = s2.subscribe({ .on_insert = [](const Employee& e){ log("hired", e.name); } });
+```
+```cpp
+// std::format introspection
+std::println("{:stats}", s);                                  // per-index kinds + load factors
+auto lf = s.stats().index<"by_email">().load_factor;          // structured access
+```
+
+See [`EXAMPLES.md`](EXAMPLES.md) for the annotated, section-by-section tour.
+
 ## Key safety with pointer elements
 
 A multi-index container only stays correct if **keys change exclusively through

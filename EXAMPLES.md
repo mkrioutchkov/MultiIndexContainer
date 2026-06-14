@@ -372,6 +372,23 @@ for (auto&& [dept, group] : mic::queries::group_by(staff.get<"by_dept">()))
     std::println("{}: {} people", dept, std::ranges::distance(group));
 ```
 
+`equi_join` works on **composite keys** too, as long as both indices share the
+*same* key type (e.g. both keyed on `(region, category)` → `std::tuple<string,int>`);
+it joins on the whole tuple.
+
+**Joining on a key prefix.** To join a table keyed on `K` to one keyed on a
+composite `(K, …)` — say per-region quotas to sales keyed on `(region, category)` —
+the key types differ, so `equi_join` doesn't apply. Use a prefix `equal_range`
+instead (the composite comparator matches on the leading component):
+
+```cpp
+for (const Quota& q : quotas.get<"by_region">()) {
+    auto [lo, hi] = sales.get<"by_region_cat">().equal_range(mic::prefix(q.region));
+    for (auto it = lo; it != hi; ++it)
+        std::println("{} (target {}) <- {}/{}", q.region, q.target, it->region, it->category);
+}
+```
+
 ---
 
 ## 13. Compile-time tables (`constexpr`)
