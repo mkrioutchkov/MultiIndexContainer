@@ -17,6 +17,46 @@ This repo ships two things:
 
 ---
 
+## 0. Online sandpits (incl. vs Boost)
+
+You don't need to own a machine. These all run Boost.MultiIndex too — the
+benchmark adds a Boost column automatically when `libboost-dev` is installed
+(`#if __has_include(<boost/multi_index_container.hpp>)`).
+
+| Sandpit | How | Boost | Profiling | Best for |
+|---|---|---|---|---|
+| **GitHub Actions** (this repo) | Actions tab → **benchmark** → *Run workflow* | yes (auto) | no (just timings) | one-click mic-vs-Boost numbers + a GCC parity check |
+| **GitHub Codespaces** (this repo) | green *Code* → *Codespaces* → create | `apt install libboost-dev` (the [devcontainer](.devcontainer/devcontainer.json) does it for you) | callgrind / cachegrind / Google Benchmark (hardware `perf` usually blocked in the container) | interactive hacking + deterministic profiling |
+| **Oracle Cloud Always Free (Ampere A1)** | free aarch64 VM, up to 4 cores | `apt install libboost-dev` | full `perf` + VTune-equivalents (real VM) | a free, dedicated-ish box (ARM, so note the arch) |
+| **Compiler Explorer** ([godbolt.org](https://godbolt.org)) | paste a snippet, add Boost from the libraries dropdown | yes | asm + opt-remarks, not throughput | comparing the *generated code* of a mic op vs the Boost op |
+| **Hetzner CCX / AWS c7i** by the hour | spin up, run, destroy (pennies) | `apt install libboost-dev` | full `perf` + VTune | trustworthy **x86 absolute** numbers |
+
+**Caveat that matters:** Actions and Codespaces are *shared* hosts, so absolute
+ns/op is noisy. But comparing **mic vs Boost vs std within one run** is fair — they
+all suffer the same noise — so those *relative* ratios are trustworthy. For
+absolute headline throughput, use a dedicated box (§1) or `callgrind` (which
+counts instructions, not wall-clock, so it's immune to host noise).
+
+**One-click recipes for this repo:**
+
+* *GitHub Actions:* Actions tab → **benchmark** → *Run workflow* → enter sizes →
+  read the log / download the `bench-results` artifact. (Also runs the suite and
+  examples on GCC 14, telling us if anything is non-GCC-clean.)
+* *Codespaces:* open a Codespace (the devcontainer pre-installs GCC 14 + Boost +
+  valgrind), then:
+  ```bash
+  g++-14 -std=c++23 -O3 -DNDEBUG -I include benchmarks/bench.cpp -o bench
+  ./bench 100000 1000000                       # Boost column included
+  valgrind --tool=callgrind ./bench 10000      # deterministic profile, host-noise-proof
+  callgrind_annotate callgrind.out.*           # per-function instruction counts
+  ```
+
+> The library is developed on MSVC; **GCC/Clang are a parity goal, not yet
+> CI-proven** — the Actions `parity` job is exactly how we find and fix any
+> GCC-specific nits. If it's red, that's information, not alarm.
+
+---
+
 ## 1. Where to run it (the "sandpit")
 
 You want a dedicated CPU, not a shared/burstable one.

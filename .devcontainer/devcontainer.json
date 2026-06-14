@@ -1,0 +1,16 @@
+{
+  "name": "mic C++23 sandpit (gcc-14 + Boost)",
+  "image": "mcr.microsoft.com/devcontainers/cpp:ubuntu-24.04",
+  "postCreateCommand": "sudo apt-get update && sudo apt-get install -y g++-14 libboost-dev valgrind kcachegrind cmake",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-vscode.cpptools",
+        "ms-vscode.cmake-tools"
+      ]
+    }
+  },
+  "postAttachCommand": {
+    "hint": "echo 'Ready. Build the benchmark (Boost column auto-on): g++-14 -std=c++23 -O3 -DNDEBUG -I include benchmarks/bench.cpp -o bench && ./bench 100000 1000000'"
+  }
+}
