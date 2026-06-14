@@ -248,6 +248,10 @@ void test_multi_uniqueness() {
     auto r = t.try_insert(Rec{3, "c", "x@x", 0});
     CHECK(!r.has_value());
     CHECK(r.error().index_tag == "by_email");
+    CHECK(r.error().index_pos == 1);                        // by_email is index #1
+    CHECK(r.error().blocking != nullptr);
+    CHECK(r.error().blocking->id == 1);                     // collided with the live element
+    CHECK(t.size() == 1);                                   // rejected insert leaves container intact
 }
 
 // ===========================================================================
@@ -269,6 +273,8 @@ void test_modify_replace() {
     CHECK(id.modify(it, [](Rec& r) { r.score = 999; }));      // key change -> by_score
     CHECK(it->id == 1);                                       // by_id iterator still valid
     CHECK(t.get<"by_score">().lower_bound(999)->id == 1);
+    CHECK(t.get<"by_score">().count(999) == 1);               // inline-key cache refreshed: new key found
+    CHECK(t.get<"by_score">().count(100) == 0);               // ...and the stale old key is gone
 
     bool ok = id.modify(it, [](Rec& r) { r.email = "b@x"; }); // conflict -> rollback
     CHECK(!ok);
@@ -427,6 +433,14 @@ void test_ranked() {
     CHECK(ri.rank(ri.find(3)) == 2);
     auto [it, ok] = t.insert(Rec{1, "x", "x", 0});  // ranked_unique rejects dup id
     CHECK(!ok);
+
+    // order-statistics round trip: rank(nth(i)) == i across the whole index, and
+    // the end()/size boundaries agree.
+    for (std::size_t i = 0; i < t.size(); ++i) CHECK(rs.rank(rs.nth(i)) == i);
+    CHECK(rs.nth(t.size()) == rs.end());
+    CHECK(rs.rank(rs.end()) == t.size());
+    CHECK(rs.lower_bound(10) == rs.equal_range(10).first);
+    CHECK(rs.upper_bound(10) == rs.equal_range(10).second);
 }
 
 // ===========================================================================
@@ -628,6 +642,189 @@ void test_hashed_stress() {
     verify();
 }
 
+// ===========================================================================
+//  insert_error names WHICH unique index rejected an insert, across all index
+//  kinds, and carries the blocking element. (mic-over-Boost diagnostic.)
+void test_insert_diagnostics() {
+    std::println("[cov] insert_error: which index rejected + blocking element");
+    struct User { std::uint64_t id; std::string username; std::string email; };
+    using T = mic::multi_index_container<User, mic::indexed_by<
+        mic::ordered_unique<"by_id",       mic::key<&User::id>>,
+        mic::hashed_unique <"by_username", mic::key<&User::username>>,
+        mic::hashed_unique <"by_email",    mic::key<&User::email>>>>;
+    T t;
+    t.insert(User{1, "ada",   "ada@x.io"});
+    t.insert(User{2, "linus", "linus@x.io"});
+
+    // id collision -> ordered_unique index #0
+    {
+        auto r = t.try_insert(User{1, "fresh", "fresh@x.io"});
+        CHECK(!r);
+        CHECK(r.error().index_tag == "by_id");
+        CHECK(r.error().index_pos == 0);
+        CHECK(r.error().blocking->username == "ada");
+    }
+    // username collision -> hashed_unique index #1
+    {
+        auto r = t.try_insert(User{9, "ada", "new@x.io"});
+        CHECK(!r);
+        CHECK(r.error().index_tag == "by_username");
+        CHECK(r.error().index_pos == 1);
+        CHECK(r.error().blocking->id == 1);
+    }
+    // email collision -> hashed_unique index #2
+    {
+        auto r = t.try_insert(User{9, "newname", "linus@x.io"});
+        CHECK(!r);
+        CHECK(r.error().index_tag == "by_email");
+        CHECK(r.error().index_pos == 2);
+        CHECK(r.error().blocking->id == 2);
+    }
+    CHECK(t.size() == 2);                                   // none of the rejects landed
+
+    // a fully fresh element succeeds and the expected holds an iterator to it
+    auto ok = t.try_insert(User{3, "carol", "carol@x.io"});
+    CHECK(ok.has_value());
+    CHECK((**ok).id == 3);
+    CHECK(t.size() == 3);
+}
+
+// ===========================================================================
+//  Deeper composite-key coverage: a 3-component key, exact + every prefix
+//  length + open-ended bracketed ranges.
+void test_composite_prefix() {
+    std::println("[cov] composite full key + 1/2-prefix + open-ended ranges");
+    struct Emp { std::string dept; int level; std::string name; };
+    using T = mic::multi_index_container<Emp, mic::indexed_by<
+        mic::ordered_non_unique<"k", mic::key<&Emp::dept, &Emp::level, &Emp::name>>>>;
+    T t;
+    t.insert(Emp{"Eng",   3, "Ada"});
+    t.insert(Emp{"Eng",   3, "Bjarne"});
+    t.insert(Emp{"Eng",   5, "Carol"});
+    t.insert(Emp{"Eng",   2, "Dan"});
+    t.insert(Emp{"Sales", 2, "Eve"});
+    t.insert(Emp{"Sales", 4, "Frank"});
+    auto k = t.get<"k">();
+
+    // full key -> exactly one
+    CHECK(k.count(std::tuple{std::string("Eng"), 5, std::string("Carol")}) == 1);
+    auto f = k.find(std::tuple{std::string("Eng"), 5, std::string("Carol")});
+    CHECK(f != k.end() && f->name == "Carol");
+
+    // 1-prefix -> whole department
+    CHECK(k.count(std::tuple{std::string("Eng")}) == 4);
+    CHECK(k.count(std::tuple{std::string("Sales")}) == 2);
+    CHECK(k.count(std::tuple{std::string("Nope")}) == 0);
+
+    // 2-prefix -> one level within a department
+    {
+        auto [lo, hi] = k.equal_range(std::tuple{std::string("Eng"), 3});
+        CHECK(std::distance(lo, hi) == 2);                 // Ada, Bjarne
+        std::vector<std::string> names;
+        for (auto it = lo; it != hi; ++it) names.push_back(it->name);
+        CHECK((names == std::vector<std::string>{"Ada", "Bjarne"}));
+    }
+
+    // open-ended bracket: Eng levels [2,4] -> Dan(2), Ada(3), Bjarne(3)
+    {
+        auto lo = k.lower_bound(std::tuple{std::string("Eng"), 2});
+        auto hi = k.upper_bound(std::tuple{std::string("Eng"), 4});
+        int n = 0;
+        for (auto it = lo; it != hi; ++it) { CHECK(it->level >= 2 && it->level <= 4); ++n; }
+        CHECK(n == 3);
+    }
+
+    // global order is lexicographic across the whole composite
+    std::vector<std::string> order;
+    for (const Emp& e : k) order.push_back(e.name);
+    CHECK((order == std::vector<std::string>{"Dan", "Ada", "Bjarne", "Carol", "Eve", "Frank"}));
+}
+
+// ===========================================================================
+//  std::from_range construction and std::format summary.
+void test_from_range_and_format() {
+    std::println("[cov] std::from_range ctor + std::format summary");
+    using T = mic::multi_index_container<Rec, mic::indexed_by<
+        mic::ordered_unique<"by_id", mic::key<&Rec::id>>,
+        mic::hashed_unique <"by_em", mic::key<&Rec::email>>>>;
+    std::vector<Rec> seed{{1, "a", "a@x", 0}, {2, "b", "b@x", 0}, {3, "c", "c@x", 0}};
+    T t(std::from_range, seed);
+    CHECK(t.size() == 3);
+    CHECK(t.get<"by_id">().contains(2));
+    CHECK(t.get<"by_em">().find("c@x")->id == 3);
+    CHECK(std::format("{}", t) == "multi_index(size=3)");
+}
+
+// ===========================================================================
+//  Transparent (heterogeneous) hashed lookup: string_view / const char* probes
+//  hit a std::string-keyed index without constructing a std::string.
+void test_transparent_lookup() {
+    std::println("[cov] transparent hashed lookup (string_view / const char*)");
+    using T = mic::multi_index_container<Rec, mic::indexed_by<
+        mic::hashed_unique    <"by_email", mic::key<&Rec::email>>,
+        mic::hashed_non_unique<"by_name",  mic::key<&Rec::name>>>>;
+    T t;
+    t.insert(Rec{1, "ada",  "ada@x.io",  0});
+    t.insert(Rec{2, "ada",  "ada2@x.io", 0});
+    t.insert(Rec{3, "bob",  "bob@x.io",  0});
+
+    auto em = t.get<"by_email">();
+    std::string_view sv = "ada@x.io";
+    CHECK(em.find(sv)->id == 1);                 // string_view probe
+    CHECK(em.find("bob@x.io")->id == 3);         // const char* probe
+    CHECK(em.contains(std::string_view{"ada2@x.io"}));
+    CHECK(!em.contains("missing@x.io"));
+    CHECK(em.count("ada@x.io") == 1);
+
+    auto nm = t.get<"by_name">();
+    CHECK(nm.count(std::string_view{"ada"}) == 2);
+    auto [lo, hi] = nm.equal_range("ada");
+    CHECK(std::distance(lo, hi) == 2);
+    CHECK(nm.count("nobody") == 0);
+}
+
+// ===========================================================================
+//  A moved-from container (incl. its hashed indices) is a valid, queryable empty
+//  container — querying it must not divide-by-zero, and it can be refilled.
+void test_moved_from_valid() {
+    std::println("[cov] moved-from container is a valid empty queryable container");
+    using T = mic::multi_index_container<Rec, mic::indexed_by<
+        mic::hashed_unique     <"by_email", mic::key<&Rec::email>>,
+        mic::hashed_non_unique <"by_name",  mic::key<&Rec::name>>,
+        mic::ordered_unique    <"by_id",    mic::key<&Rec::id>>>>;
+    // ---- move construction ----
+    {
+        T a;
+        a.insert(Rec{1, "ada", "ada@x", 0});
+        a.insert(Rec{2, "bob", "bob@x", 0});
+        T b = std::move(a);
+        CHECK(b.size() == 2);
+        // querying the moved-from source must not crash (was: %0 divide-by-zero)
+        CHECK(a.size() == 0);
+        CHECK(a.get<"by_email">().find("ada@x") == a.get<"by_email">().end());
+        CHECK(a.get<"by_email">().count("ada@x") == 0);
+        CHECK(a.get<"by_name">().count("ada") == 0);
+        CHECK(a.begin() == a.end());
+        // ...and it can be refilled and used normally
+        a.insert(Rec{7, "carol", "carol@x", 0});
+        a.insert(Rec{8, "dave",  "dave@x",  0});
+        CHECK(a.size() == 2);
+        CHECK(a.get<"by_email">().find("carol@x")->id == 7);
+        CHECK(a.get<"by_id">().contains(8));
+    }
+    // ---- move assignment ----
+    {
+        T a; a.insert(Rec{1, "x", "x@x", 0});
+        T b; b.insert(Rec{2, "y", "y@x", 0}); b.insert(Rec{3, "z", "z@x", 0});
+        a = std::move(b);
+        CHECK(a.size() == 2);
+        CHECK(b.get<"by_email">().count("y@x") == 0);   // moved-from source: no crash
+        b.insert(Rec{9, "w", "w@x", 0});                // still usable
+        CHECK(b.get<"by_email">().find("w@x")->id == 9);
+        CHECK(b.size() == 1);
+    }
+}
+
 } // namespace
 
 int main() {
@@ -640,8 +837,13 @@ int main() {
     test_extractors();
     test_deref_chains();
     test_multi_uniqueness();
+    test_insert_diagnostics();
+    test_composite_prefix();
+    test_from_range_and_format();
+    test_transparent_lookup();
     test_modify_replace();
     test_copy_move_swap();
+    test_moved_from_valid();
     test_ctors();
     test_node_handle_and_merge();
     test_projection();

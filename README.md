@@ -70,7 +70,9 @@ for (const Employee& e : s.get<"by_salary">() | std::views::reverse) { /* high�
   allocation (element nodes **and** all per-index structures) through one
   `std::pmr::memory_resource`, so a pool / `monotonic_buffer_resource` serves the
   whole container.
-* **Modern API** — `std::expected`-returning `try_insert`, `std::ranges`-ready
+* **Modern API** — `std::expected`-returning `try_insert` whose `insert_error`
+  names *which* unique index rejected the insert (by tag) **and** points at the
+  blocking element — a diagnostic Boost doesn't surface; `std::ranges`-ready
   index views (compose `views::filter` / `reverse` / `take`), `std::format`
   support, and `std::from_range` construction.
 
@@ -136,7 +138,10 @@ flags, allocation profiling, and `perf` / VTune / Google Benchmark workflows.
 * [`EXAMPLES.md`](EXAMPLES.md) — annotated API usage examples.
 * [`BENCHMARKING.md`](BENCHMARKING.md) — how to profile and benchmark properly.
 * [`examples/`](examples) — complete, compiled example programs: LRU cache,
-  order book, const-element safety, observer registry, symbol table.
+  order book, const-element safety, observer registry, symbol table,
+  [insert diagnostics](examples/insert_diagnostics.cpp) (*which* index rejected
+  an insert), [composite keys](examples/composite_keys.cpp) (full + prefix
+  lookups), and a [modern-API tour](examples/modern_api.cpp).
 * [`playground/`](playground) — a Visual Studio project; open the `.sln`, press F5.
 
 ## Status & v1 limitations

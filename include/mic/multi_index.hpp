@@ -560,11 +560,21 @@ class intrusive_hash {
         buckets_.swap(nbk);
     }
     void maybe_grow() { if (static_cast<float>(n_) > max_lf_ * static_cast<float>(buckets_.size())) rehash_to(buckets_.size() * 2); }
+    // Restore a just-moved-from table to a valid empty state (one null bucket): a
+    // single-pointer allocation, so the modulo in every keyed op stays well-defined.
+    void reseed_empty() noexcept { buckets_.assign(1, nullptr); n_ = 0; }
 
 public:
     explicit intrusive_hash(const Alloc& a = Alloc{}) : buckets_(8, nullptr, bucket_alloc(a)) {}
-    intrusive_hash(intrusive_hash&& o) noexcept : buckets_(std::move(o.buckets_)), n_(o.n_), max_lf_(o.max_lf_) { o.n_ = 0; }
-    intrusive_hash& operator=(intrusive_hash&& o) noexcept { buckets_ = std::move(o.buckets_); n_ = o.n_; max_lf_ = o.max_lf_; o.n_ = 0; return *this; }
+    // Moving steals the bucket array; re-seed the source with one (empty) bucket so a
+    // moved-from index stays a valid, queryable empty table — find/insert/erase keep
+    // working (bucket = hash % buckets_.size()) instead of dividing by zero, matching
+    // std::unordered_map's "moved-from is a valid empty container" guarantee.
+    intrusive_hash(intrusive_hash&& o) noexcept
+        : buckets_(std::move(o.buckets_)), n_(o.n_), max_lf_(o.max_lf_) { o.reseed_empty(); }
+    intrusive_hash& operator=(intrusive_hash&& o) noexcept {
+        buckets_ = std::move(o.buckets_); n_ = o.n_; max_lf_ = o.max_lf_; o.reseed_empty(); return *this;
+    }
     intrusive_hash(const intrusive_hash&) = delete;
     intrusive_hash& operator=(const intrusive_hash&) = delete;
 
@@ -774,11 +784,13 @@ template <class C> struct core_key<C, std::void_t<typename C::key_type>> { using
 // ---------------------------------------------------------------------------
 //  Error type for the std::expected-flavoured API
 // ---------------------------------------------------------------------------
+template <class Value>
 struct insert_error {
     enum class reason { duplicate_in_unique_index };
-    reason       why = reason::duplicate_in_unique_index;
-    std::size_t  index_pos = 0;
-    std::string_view index_tag;
+    reason           why = reason::duplicate_in_unique_index;
+    std::size_t      index_pos = 0;        // which index (0-based) rejected the insert
+    std::string_view index_tag;            // ...and its tag, e.g. "by_email"
+    const Value*     blocking = nullptr;   // the existing element it conflicts with
 };
 
 // ---------------------------------------------------------------------------
@@ -966,11 +978,7 @@ public:
 
         bool operator==(const index_iterator& o) const { return it_ == o.it_; }
         It    base()     const { return it_; }
-        node* get_node() const {
-            decltype(auto) s = *it_;
-            if constexpr (std::is_same_v<std::remove_cvref_t<decltype(s)>, node*>) return s;
-            else return s.p;   // inline entry { key, node* p }
-        }
+        node* get_node() const { return *it_; }   // every index iterator dereferences to the element node*
     };
 
 private:
@@ -1386,15 +1394,16 @@ public:
     template <std::input_iterator It> void insert(It first, It last) { for (; first != last; ++first) insert(*first); }
     void insert(std::initializer_list<Value> il) { for (const auto& v : il) insert(v); }
 
-    std::expected<iterator, insert_error> try_insert(const Value& v) { return try_insert_impl(make_node(v)); }
-    std::expected<iterator, insert_error> try_insert(Value&& v)      { return try_insert_impl(make_node(std::move(v))); }
+    std::expected<iterator, insert_error<Value>> try_insert(const Value& v) { return try_insert_impl(make_node(v)); }
+    std::expected<iterator, insert_error<Value>> try_insert(Value&& v)      { return try_insert_impl(make_node(std::move(v))); }
 private:
-    std::expected<iterator, insert_error> try_insert_impl(node* p) {
+    std::expected<iterator, insert_error<Value>> try_insert_impl(node* p) {
         node* conflict = nullptr; std::size_t failed = N;
         if (!insert_all<0>(p, conflict, failed)) {
             destroy_node(p);
-            insert_error e;
+            insert_error<Value> e;
             e.index_pos = failed;
+            e.blocking  = conflict ? &conflict->value : nullptr;
             visit_tag(failed, [&](std::string_view t) { e.index_tag = t; });
             return std::unexpected(e);
         }

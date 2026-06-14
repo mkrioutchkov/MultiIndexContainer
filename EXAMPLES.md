@@ -74,21 +74,26 @@ returns an iterator into the **first declared index**; access is `get<"tag">()` 
 
 ```cpp
 // try_insert never returns a bare bool — on failure it names the offending index.
-std::expected<EmployeeTable::iterator, mic::insert_error> r =
+std::expected<EmployeeTable::iterator, mic::insert_error<Employee>> r =
     staff.try_insert(Employee{.id = 1, .email = "dup@x.io"}); // id 1 already exists
 
 if (!r) {
-    mic::insert_error e = r.error();
-    std::println("rejected by index '{}': {}", e.index_tag(), e.reason());
-    // e.reason() == mic::insert_error::reason::duplicate_in_unique_index
-    // e.blocking() -> const Employee&  (the element that owns the conflicting key)
+    const mic::insert_error<Employee>& e = r.error();
+    std::println("rejected by index '{}' (#{})", e.index_tag, e.index_pos);
+    // e.why      == mic::insert_error<Employee>::reason::duplicate_in_unique_index
+    // e.index_tag -> std::string_view  ("by_id")
+    // e.blocking  -> const Employee*    (the live element that owns the conflicting key)
+    std::println("conflicts with existing id {}", e.blocking->id);
 }
 
-// Monadic composition:
+// Monadic composition (note *it dereferences the iterator the expected holds):
 auto name = staff.try_insert(newHire)
                  .transform([](auto it) { return it->name; })
                  .value_or("<not inserted>");
 ```
+
+See [`examples/insert_diagnostics.cpp`](examples/insert_diagnostics.cpp) for a runnable
+version that reports which of several unique indices rejected each insert.
 
 **Decision:** `insert`/`emplace` keep the classic `pair<iterator,bool>`; `try_insert`/
 `try_emplace` are the `expected`-returning twins. Same for `try_modify`/`try_replace`.
@@ -309,11 +314,13 @@ std::pmr::monotonic_buffer_resource res{arena.data(), arena.size()};
 mic::pmr::multi_index<Employee, mic::indexed_by</*...*/>> fast{&res};
 
 // (b) static_multi_index — bounded capacity, zero heap, constexpr-friendly.
+//     PLANNED — not in v1. Sketch of the intended shape; `capacity_exceeded`
+//     would join `insert_error<Employee>::reason` once a fixed variant ships.
 using Fixed = mic::static_multi_index<Employee, /*N=*/64,
     mic::indexed_by<mic::ordered_unique<"by_id", mic::key<&Employee::id>>>>;
 Fixed embedded;
 auto r = embedded.try_insert(Employee{/*...*/});
-if (!r && r.error().reason() == mic::insert_error::reason::capacity_exceeded) { /*...*/ }
+if (!r && r.error().why == mic::insert_error<Employee>::reason::capacity_exceeded) { /*...*/ }
 ```
 
 ---
