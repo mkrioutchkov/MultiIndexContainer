@@ -59,9 +59,10 @@ for (const Employee& e : s.get<"by_salary">() | std::views::reverse) { /* high�
 * **Transparent hashed lookup** — `get<"by_email">().find("literal")` /
   `find(string_view)` hashes through `string_view` with **zero key
   materialisation** (string keys are transparent by default).
-* **Fast ordered lookup** — small trivially-copyable keys (e.g. `int` ids) are
-  stored inline in the index node, so `find` compares the key directly instead
-  of chasing a pointer to it.
+* **Intrusive ordered/ranked indices** — the balanced AVL tree links live inside
+  the element node (no separate `std::set` node per element), so ordered/ranked
+  indices are **single-allocation** and `find` matches `std::set`/Boost. Small
+  trivially-copyable keys are cached next to the links for cache-friendly compares.
 * **`std::pmr` support** — `mic::pmr::multi_index_container<...>` routes *every*
   allocation (element nodes **and** all per-index structures) through one
   `std::pmr::memory_resource`, so a pool / `monotonic_buffer_resource` serves the
@@ -146,9 +147,12 @@ Known limitations, slated for later work:
   iterators into *unchanged* indices stay valid (as in Boost). The one
   unsupported combination is changing a **hashed** index's key on a
   **pointer-stored** element via `modify()` — use value storage or `replace()`.
-* Each element still uses `1 + (#keyed indices)` allocations (node-based, not
-  single-allocation intrusive) — `mic::pmr::multi_index_container` makes that
-  cheap by pooling, but a flat/intrusive storage policy is still future work.
+* **Ordered & ranked indices are intrusive** — their balanced (AVL,
+  size-augmented) tree links live *inside the element node*, so they add **no
+  per-element allocation** and `find` matches `std::set`/Boost. **Hashed** and
+  **sequenced** indices still use `std::unordered_set`/`std::list` (one node per
+  element each); making those intrusive too is the remaining step toward full
+  single-allocation. `mic::pmr::multi_index_container` pools whatever remains.
 * Not yet implemented: serialization, the concurrent variants, and coroutine
   query helpers.
 

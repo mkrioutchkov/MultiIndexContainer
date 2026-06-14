@@ -215,10 +215,12 @@ and pin the process as in §1. Emit `--benchmark_out=results.json` and diff with
 
 So you can sanity-check your results against the implementation:
 
-* **Ordered `find`** ≈ `std::set`/`std::map` find. Small trivially-copyable keys
-  (e.g. `int`) are stored inline in the index node, so the comparison reads the
-  key directly — `find(id)` is at or slightly above `std::map`. String/large keys
-  keep pointer storage (one extra indirection per compare).
+* **Ordered `find` matches `std::set`/Boost** — ordered/ranked indices are an
+  intrusive, size-augmented **AVL** tree (links inside the node, no separate
+  allocation), so they're balanced like `std::set` and single-allocation like
+  Boost. Small trivially-copyable keys are cached next to the links; `find(id)`
+  ties or beats Boost. (Hashed find is still ~1.3–1.5× Boost — `std::unordered_set`
+  vs Boost's intrusive hash.)
 * **Hashed `find` is transparent** — string keys hash through `string_view`, so
   `find("literal")` / `find(string_view)` does no key materialisation; expect it
   near `std::unordered_map`. (A non-transparent *user-supplied* hasher falls back
