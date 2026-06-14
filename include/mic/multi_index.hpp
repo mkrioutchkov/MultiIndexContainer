@@ -531,46 +531,131 @@ struct tree_core {
     void remove(NodePtr p, hook_type&) { c.erase_node(p); }
 };
 
-template <class NodePtr, class Extractor, class Hash, class Eq, bool Unique, class Alloc>
-struct hashed_core {
-    static constexpr index_kind kind = index_kind::hashed;
-    using key_type  = std::remove_cvref_t<typename Extractor::result_type>;
-    using ptr_alloc = typename std::allocator_traits<Alloc>::template rebind_alloc<NodePtr>;
+// Intrusive hash chaining stored inside the element node (one per hashed index).
+template <class NodePtr>
+struct hash_hook { NodePtr next = nullptr; std::size_t hash = 0; };
 
-    template <class T> static decltype(auto) keyof(const T& t) {
+// Intrusive bucketed hash table: chains thread through std::get<I>(node->hooks),
+// so elements add no allocation (only the bucket array, which grows on rehash).
+// Transparent (heterogeneous lookup hashes/compares without materialising the
+// key) and keeps equal keys contiguous so equal_range works for non-unique.
+template <std::size_t I, class NodePtr, class Extractor, class Hash, class Eq, bool Unique, class Alloc>
+class intrusive_hash {
+    static hash_hook<NodePtr>& H(NodePtr p) { return std::get<I>(p->hooks); }
+    template <class T> static decltype(auto) kof(const T& t) {
         if constexpr (std::is_same_v<std::remove_cvref_t<T>, NodePtr>) return Extractor{}((*t).value);
         else return (t);
     }
+    template <class A, class B> static bool keq(const A& a, const B& b) { return Eq{}(kof(a), kof(b)); }
+
+    using bucket_alloc = typename std::allocator_traits<Alloc>::template rebind_alloc<NodePtr>;
+    std::vector<NodePtr, bucket_alloc> buckets_;
+    std::size_t n_ = 0;
+    float max_lf_ = 1.0f;
+
+    void rehash_to(std::size_t nb) {
+        std::vector<NodePtr, bucket_alloc> nbk(nb, nullptr, buckets_.get_allocator());
+        for (NodePtr head : buckets_)
+            for (NodePtr p = head; p; ) { NodePtr nx = H(p).next; std::size_t b = H(p).hash % nb; H(p).next = nbk[b]; nbk[b] = p; p = nx; }
+        buckets_.swap(nbk);
+    }
+    void maybe_grow() { if (static_cast<float>(n_) > max_lf_ * static_cast<float>(buckets_.size())) rehash_to(buckets_.size() * 2); }
+
+public:
+    explicit intrusive_hash(const Alloc& a = Alloc{}) : buckets_(8, nullptr, bucket_alloc(a)) {}
+    intrusive_hash(intrusive_hash&& o) noexcept : buckets_(std::move(o.buckets_)), n_(o.n_), max_lf_(o.max_lf_) { o.n_ = 0; }
+    intrusive_hash& operator=(intrusive_hash&& o) noexcept { buckets_ = std::move(o.buckets_); n_ = o.n_; max_lf_ = o.max_lf_; o.n_ = 0; return *this; }
+    intrusive_hash(const intrusive_hash&) = delete;
+    intrusive_hash& operator=(const intrusive_hash&) = delete;
+
+    void clear() { std::fill(buckets_.begin(), buckets_.end(), nullptr); n_ = 0; }   // nodes freed by the container
+    void swap(intrusive_hash& o) noexcept { using std::swap; swap(buckets_, o.buckets_); swap(n_, o.n_); swap(max_lf_, o.max_lf_); }
+    std::size_t size() const { return n_; }
+    bool empty() const { return n_ == 0; }
+    std::size_t bucket_count() const { return buckets_.size(); }
+    float load_factor() const { return static_cast<float>(n_) / static_cast<float>(buckets_.size()); }
+    float max_load_factor() const { return max_lf_; }
+    void  max_load_factor(float z) { max_lf_ = z; }
+
+    struct iterator {
+        const intrusive_hash* tbl = nullptr;
+        NodePtr cur = nullptr;
+        using value_type        = NodePtr;
+        using reference         = NodePtr;
+        using pointer           = NodePtr;
+        using difference_type   = std::ptrdiff_t;
+        using iterator_category = std::forward_iterator_tag;
+        using iterator_concept  = std::forward_iterator_tag;
+        iterator() = default;
+        iterator(const intrusive_hash* t, NodePtr c) : tbl(t), cur(c) {}
+        reference operator*()  const { return cur; }
+        iterator& operator++() {
+            if (H(cur).next) { cur = H(cur).next; return *this; }
+            std::size_t b = H(cur).hash % tbl->buckets_.size() + 1;
+            while (b < tbl->buckets_.size() && !tbl->buckets_[b]) ++b;
+            cur = (b < tbl->buckets_.size()) ? tbl->buckets_[b] : nullptr;
+            return *this;
+        }
+        iterator operator++(int) { auto t = *this; ++*this; return t; }
+        bool operator==(const iterator& o) const { return cur == o.cur; }
+    };
+    using const_iterator = iterator;
+    iterator begin() const { for (std::size_t b = 0; b < buckets_.size(); ++b) if (buckets_[b]) return { this, buckets_[b] }; return end(); }
+    iterator end()   const { return { this, nullptr }; }
+
+    template <class K> NodePtr find_node(const K& k) const {
+        for (NodePtr p = buckets_[Hash{}(k) % buckets_.size()]; p; p = H(p).next) if (keq(p, k)) return p;
+        return nullptr;
+    }
+    template <class K> iterator find(const K& k) const { return { this, find_node(k) }; }
+    template <class K> std::size_t count(const K& k) const {
+        std::size_t c = 0;
+        for (NodePtr p = buckets_[Hash{}(k) % buckets_.size()]; p; p = H(p).next) if (keq(p, k)) ++c;
+        return c;
+    }
+    template <class K> std::pair<iterator, iterator> equal_range(const K& k) const {
+        NodePtr first = find_node(k);
+        if (!first) return { end(), end() };
+        NodePtr last = first;
+        while (H(last).next && keq(H(last).next, k)) last = H(last).next;   // equal keys are contiguous
+        iterator e{ this, last }; ++e;
+        return { iterator{ this, first }, e };
+    }
+
+    bool try_add(NodePtr p, NodePtr& conflict) {
+        std::size_t h = Hash{}(Extractor{}((*p).value));
+        H(p).hash = h; H(p).next = nullptr;
+        std::size_t b = h % buckets_.size();
+        for (NodePtr q = buckets_[b]; q; q = H(q).next) {
+            if (keq(q, p)) {
+                if constexpr (Unique) { conflict = q; return false; }
+                else { H(p).next = H(q).next; H(q).next = p; ++n_; maybe_grow(); return true; }  // splice into the group
+            }
+        }
+        H(p).next = buckets_[b]; buckets_[b] = p; ++n_;   // new key: prepend
+        maybe_grow();
+        return true;
+    }
+    void erase_node(NodePtr z) {
+        NodePtr* pp = &buckets_[H(z).hash % buckets_.size()];   // cached hash -> right bucket even after a key change
+        while (*pp && *pp != z) pp = &H(*pp).next;
+        if (*pp == z) { *pp = H(z).next; --n_; }
+    }
+};
+
+template <std::size_t I, class NodePtr, class Extractor, class Hash, class Eq, bool Unique, class Alloc>
+struct hash_core {
+    static constexpr index_kind kind = index_kind::hashed;
+    using key_type = std::remove_cvref_t<typename Extractor::result_type>;
     template <class V> static key_type extract_key(const V& v) { return Extractor{}(v); }
     static bool keys_equal(const key_type& a, const key_type& b) { return Eq{}(a, b); }
-    struct node_hash {
-        using is_transparent = void;
-        template <class T> std::size_t operator()(const T& t) const { return Hash{}(keyof(t)); }
-    };
-    struct node_eq {
-        using is_transparent = void;
-        template <class A, class B> bool operator()(const A& a, const B& b) const {
-            return Eq{}(keyof(a), keyof(b));
-        }
-    };
-    using container = std::conditional_t<Unique,
-        std::unordered_set<NodePtr, node_hash, node_eq, ptr_alloc>,
-        std::unordered_multiset<NodePtr, node_hash, node_eq, ptr_alloc>>;
-    using hook_type = typename container::iterator;
+    using container = intrusive_hash<I, NodePtr, Extractor, Hash, Eq, Unique, Alloc>;
+    using hook_type = hash_hook<NodePtr>;
     container c;
-    hashed_core() = default;
-    explicit hashed_core(const Alloc& a) : c(ptr_alloc(a)) {}
-
-    bool try_insert(NodePtr p, hook_type& out, NodePtr& conflict) {
-        if constexpr (Unique) {
-            auto [it, ok] = c.insert(p);
-            if (!ok) { conflict = *it; return false; }
-            out = it; return true;
-        } else {
-            out = c.insert(p); return true;
-        }
-    }
-    void remove(NodePtr p, hook_type& h) { (void)p; c.erase(h); }
+    hash_core() = default;
+    explicit hash_core(const Alloc& a) : c(a) {}
+    bool try_insert(NodePtr p, hook_type&, NodePtr& conflict) { return c.try_add(p, conflict); }
+    void remove(NodePtr p, hook_type&) { c.erase_node(p); }
 };
 
 template <class NodePtr, class Alloc>
@@ -614,9 +699,9 @@ struct core_for<ranked_unique<T, E, C>, NP, A, I> { using type = tree_core<I, NP
 template <fixed_string T, class E, class C, class NP, class A, std::size_t I>
 struct core_for<ranked_non_unique<T, E, C>, NP, A, I> { using type = tree_core<I, NP, E, C, false, A>; };
 template <fixed_string T, class E, class H, class Q, class NP, class A, std::size_t I>
-struct core_for<hashed_unique<T, E, H, Q>, NP, A, I> { using type = hashed_core<NP, E, H, Q, true, A>; };
+struct core_for<hashed_unique<T, E, H, Q>, NP, A, I> { using type = hash_core<I, NP, E, H, Q, true, A>; };
 template <fixed_string T, class E, class H, class Q, class NP, class A, std::size_t I>
-struct core_for<hashed_non_unique<T, E, H, Q>, NP, A, I> { using type = hashed_core<NP, E, H, Q, false, A>; };
+struct core_for<hashed_non_unique<T, E, H, Q>, NP, A, I> { using type = hash_core<I, NP, E, H, Q, false, A>; };
 template <fixed_string T, class NP, class A, std::size_t I>
 struct core_for<sequenced<T>, NP, A, I> { using type = seq_core<NP, A>; };
 template <fixed_string T, class NP, class A, std::size_t I>
@@ -837,9 +922,9 @@ private:
         if constexpr (Core::kind == index_kind::random_access) {
             auto& c = std::get<I>(cores_).c;
             return iter_t<I>{ std::find(c.begin(), c.end(), p) };
-        } else if constexpr (Core::kind == index_kind::ordered) {   // intrusive tree: build from (tree, node)
-            return iter_t<I>{ typename Core::container::iterator{ &std::get<I>(cores_).c, p } };
-        } else {                                                    // hashed/sequenced: hook IS the std iterator
+        } else if constexpr (Core::kind == index_kind::ordered || Core::kind == index_kind::hashed) {
+            return iter_t<I>{ typename Core::container::iterator{ &std::get<I>(cores_).c, p } };   // intrusive tree/hash
+        } else {                                                    // sequenced: hook IS the std::list iterator
             return iter_t<I>{ std::get<I>(p->hooks) };
         }
     }

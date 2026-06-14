@@ -18,6 +18,7 @@
 #include <random>
 #include <ranges>
 #include <stdexcept>
+#include <set>
 #include <string>
 #include <string_view>
 #include <tuple>
@@ -576,10 +577,62 @@ void test_const_element_safety() {
     CHECK(t.get<"by_id">().contains(9));
 }
 
+void test_hashed_stress() {
+    std::println("[cov] hashed differential stress (rehash / grouping / modify vs oracle)");
+    struct Item { int id; int grp; };
+    using T = mic::multi_index_container<Item, mic::indexed_by<
+        mic::hashed_unique     <"by_id",  mic::key<&Item::id>>,
+        mic::hashed_non_unique <"by_grp", mic::key<&Item::grp>>>>;
+    T t;
+    std::mt19937 rng(7);
+    std::map<int, int> oracle;   // id -> grp
+    int next_id = 0;
+    auto verify = [&] {
+        CHECK(t.size() == oracle.size());
+        bool by_id_ok = true;
+        std::set<int> seen, expect;
+        for (auto& [id, g] : oracle) {
+            auto it = t.get<"by_id">().find(id);
+            if (it == t.get<"by_id">().end() || it->grp != g) by_id_ok = false;
+            expect.insert(id);
+        }
+        CHECK(by_id_ok);
+        for (const Item& it : t.get<"by_id">()) seen.insert(it.id);
+        CHECK(seen == expect);                                  // iteration covers all, no dups/strays
+        std::map<int, int> gcount;
+        for (auto& [id, g] : oracle) ++gcount[g];
+        bool grp_ok = true;
+        for (auto& [g, c] : gcount) {
+            if (t.get<"by_grp">().count(g) != static_cast<std::size_t>(c)) grp_ok = false;
+            auto [lo, hi] = t.get<"by_grp">().equal_range(g);    // contiguous group
+            if (static_cast<std::size_t>(std::distance(lo, hi)) != static_cast<std::size_t>(c)) grp_ok = false;
+        }
+        CHECK(grp_ok);
+    };
+    for (int round = 0; round < 800; ++round) {
+        int op = static_cast<int>(rng() % 3);
+        if (op == 0 || oracle.empty()) {
+            int id = next_id++, g = static_cast<int>(rng() % 20);
+            t.insert(Item{id, g}); oracle[id] = g;
+        } else if (op == 1) {
+            auto it = oracle.begin(); std::advance(it, rng() % oracle.size());
+            t.get<"by_id">().erase_key(it->first); oracle.erase(it);
+        } else {
+            auto it = oracle.begin(); std::advance(it, rng() % oracle.size());
+            int ng = static_cast<int>(rng() % 20);
+            t.get<"by_id">().modify(t.get<"by_id">().find(it->first), [&](Item& x) { x.grp = ng; });
+            it->second = ng;
+        }
+        if (round % 40 == 0) verify();
+    }
+    verify();
+}
+
 } // namespace
 
 int main() {
     test_sequenced();
+    test_hashed_stress();
     test_random_access();
     test_ordered_lookups();
     test_hashed_lookups();
