@@ -1,0 +1,6 @@
+# Normalise line endings: source as LF, Windows batch as CRLF.
+* text=auto eol=lf
+*.bat text eol=crlf
+*.hpp text eol=lf
+*.cpp text eol=lf
+*.md  text eol=lf
