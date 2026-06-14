@@ -1,0 +1,56 @@
+name: benchmark
+
+# Push-button "online sandpit": go to the Actions tab -> benchmark -> Run workflow.
+# It builds the benchmark against GCC 14 with Boost.MultiIndex installed, so the
+# Boost column is included, and also verifies the library compiles & passes on GCC
+# (a cross-compiler parity check vs the MSVC-developed primary).
+#
+# NOTE: GitHub-hosted runners are shared 2-core VMs, so treat absolute timings as
+# noisy. The mic-vs-Boost RELATIVE numbers within a single run are meaningful;
+# absolute throughput should come from a dedicated box (see BENCHMARKING.md).
+
+on:
+  workflow_dispatch:
+    inputs:
+      sizes:
+        description: "Element counts to benchmark (space-separated)"
+        required: false
+        default: "100000 1000000"
+
+jobs:
+  parity:
+    name: GCC 14 build + tests + examples
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install GCC 14 and Boost
+        run: sudo apt-get update && sudo apt-get install -y g++-14 libboost-dev
+      - name: Build and run tests
+        run: |
+          g++-14 -std=c++23 -O2 -I include tests/test_main.cpp tests/test_tu2.cpp -o run_tests
+          ./run_tests
+      - name: Build and run examples
+        run: |
+          set -e
+          for f in examples/*.cpp; do
+            echo "== $f =="
+            g++-14 -std=c++23 -O2 -I include "$f" -o /tmp/ex
+            /tmp/ex > /dev/null && echo "  OK"
+          done
+
+  benchmark:
+    name: Benchmark vs std + Boost
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install GCC 14 and Boost
+        run: sudo apt-get update && sudo apt-get install -y g++-14 libboost-dev
+      - name: Build benchmark (Boost column auto-enabled)
+        run: g++-14 -std=c++23 -O3 -DNDEBUG -march=native -I include benchmarks/bench.cpp -o bench
+      - name: Run benchmark
+        run: ./bench ${{ github.event.inputs.sizes }} | tee bench-results.txt
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-results
+          path: bench-results.txt
