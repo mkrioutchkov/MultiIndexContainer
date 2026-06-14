@@ -339,20 +339,28 @@ namespace detail {
 // index). No separate allocation: the index lives in the node it indexes.
 template <class NodePtr>
 struct tree_hook {
-    NodePtr l = nullptr, r = nullptr, up = nullptr;
-    std::size_t   sz   = 1;
-    std::uint32_t prio = 0;
+    NodePtr      l = nullptr, r = nullptr, up = nullptr;
+    std::size_t  sz     = 1;   // subtree size  -> O(log n) nth()/rank()
+    std::int32_t height = 1;   // AVL height    -> balanced, std::set-class find
 };
 
-// Size-augmented treap whose links live in std::get<I>(node->hooks). Backs both
-// ordered indices (find/lower_bound/...) and ranked indices (nth/rank, O(log n)).
-// Comparisons re-extract the key from the node's co-located value (same cache
-// line as the links), so lookups are fast without duplicating the key.
+// Size-augmented AVL tree whose links live in std::get<I>(node->hooks). Backs
+// ordered indices (find/lower_bound/...) and ranked indices (nth/rank). Height-
+// balanced like std::set, so lookups do ~log2(n) comparisons. Comparisons
+// re-extract the key from the node's co-located value (Compare is transparent
+// over NodePtr / lookup keys).
 template <std::size_t I, class NodePtr, class Compare, bool Unique>
 class intrusive_tree {
     static tree_hook<NodePtr>& H(NodePtr p) { return std::get<I>(p->hooks); }
-    static std::size_t S(NodePtr p) { return p ? H(p).sz : 0; }
-    static void upd(NodePtr p) { if (p) H(p).sz = 1 + S(H(p).l) + S(H(p).r); }
+    static std::size_t  S(NodePtr p)  { return p ? H(p).sz : 0; }
+    static std::int32_t Ht(NodePtr p) { return p ? H(p).height : 0; }
+    static std::int32_t bf(NodePtr p) { return Ht(H(p).l) - Ht(H(p).r); }
+    static void upd(NodePtr p) {
+        if (!p) return;
+        H(p).sz = 1 + S(H(p).l) + S(H(p).r);
+        std::int32_t hl = Ht(H(p).l), hr = Ht(H(p).r);
+        H(p).height = 1 + (hl > hr ? hl : hr);
+    }
     static NodePtr leftmost(NodePtr p)  { if (!p) return nullptr; while (H(p).l) p = H(p).l; return p; }
     static NodePtr rightmost(NodePtr p) { if (!p) return nullptr; while (H(p).r) p = H(p).r; return p; }
     static NodePtr succ(NodePtr p) { if (H(p).r) return leftmost(H(p).r); while (H(p).up && p == H(H(p).up).r) p = H(p).up; return H(p).up; }
@@ -360,8 +368,6 @@ class intrusive_tree {
 
     NodePtr root_ = nullptr;
     std::size_t n_ = 0;
-    std::uint32_t rng_ = 2463534242u;
-    std::uint32_t rand_prio() { std::uint32_t x = rng_; x ^= x << 13; x ^= x >> 17; x ^= x << 5; rng_ = x; return x; }
 
     void rot_right(NodePtr y) {
         NodePtr x = H(y).l, p = H(y).up;
@@ -377,6 +383,17 @@ class intrusive_tree {
         if (p) { if (H(p).l == y) H(p).l = x; else H(p).r = x; } else root_ = x;
         upd(y); upd(x);
     }
+    void rebalance(NodePtr a) {
+        std::int32_t b = bf(a);
+        if (b > 1)       { if (bf(H(a).l) < 0) rot_left(H(a).l);  rot_right(a); }
+        else if (b < -1) { if (bf(H(a).r) > 0) rot_right(H(a).r); rot_left(a); }
+    }
+    void fixup(NodePtr a) { while (a) { NodePtr up = H(a).up; upd(a); rebalance(a); a = up; } }
+    void transplant(NodePtr u, NodePtr v) {
+        NodePtr p = H(u).up;
+        if (!p) root_ = v; else if (H(p).l == u) H(p).l = v; else H(p).r = v;
+        if (v) H(v).up = p;
+    }
     template <class K> NodePtr lb(const K& k) const {
         NodePtr t = root_, res = nullptr;
         while (t) { if (Compare{}(t, k)) t = H(t).r; else { res = t; t = H(t).l; } }
@@ -387,29 +404,43 @@ class intrusive_tree {
         while (t) { if (Compare{}(k, t)) { res = t; t = H(t).l; } else t = H(t).r; }
         return res;
     }
-    void link_in(NodePtr nn) {
-        H(nn) = tree_hook<NodePtr>{}; H(nn).prio = rand_prio();
+    void avl_insert(NodePtr nn) {
+        H(nn) = tree_hook<NodePtr>{};
         if (!root_) { root_ = nn; ++n_; return; }
         NodePtr t = root_, par = nullptr; bool left = false;
         while (t) { par = t; if (Compare{}(nn, t)) { left = true; t = H(t).l; } else { left = false; t = H(t).r; } }
         H(nn).up = par; (left ? H(par).l : H(par).r) = nn; ++n_;
-        for (NodePtr a = par; a; a = H(a).up) ++H(a).sz;
-        while (H(nn).up && H(nn).prio > H(H(nn).up).prio) {
-            if (nn == H(H(nn).up).l) rot_right(H(nn).up); else rot_left(H(nn).up);
+        fixup(par);
+    }
+    void avl_erase(NodePtr z) {
+        NodePtr fix;
+        if (H(z).l && H(z).r) {                 // two children: splice in the successor
+            NodePtr s = leftmost(H(z).r);
+            if (H(s).up != z) { fix = H(s).up; transplant(s, H(s).r); H(s).r = H(z).r; H(H(s).r).up = s; }
+            else              { fix = s; }
+            transplant(z, s);
+            H(s).l = H(z).l; if (H(s).l) H(H(s).l).up = s;
+        } else {
+            NodePtr child = H(z).l ? H(z).l : H(z).r;
+            fix = H(z).up;
+            transplant(z, child);
         }
+        fixup(fix);
+        --n_;
     }
 
 public:
     intrusive_tree() = default;
-    intrusive_tree(intrusive_tree&& o) noexcept : root_(o.root_), n_(o.n_), rng_(o.rng_) { o.root_ = nullptr; o.n_ = 0; }
-    intrusive_tree& operator=(intrusive_tree&& o) noexcept { root_ = o.root_; n_ = o.n_; rng_ = o.rng_; o.root_ = nullptr; o.n_ = 0; return *this; }
+    intrusive_tree(intrusive_tree&& o) noexcept : root_(o.root_), n_(o.n_) { o.root_ = nullptr; o.n_ = 0; }
+    intrusive_tree& operator=(intrusive_tree&& o) noexcept { root_ = o.root_; n_ = o.n_; o.root_ = nullptr; o.n_ = 0; return *this; }
     intrusive_tree(const intrusive_tree&) = delete;
     intrusive_tree& operator=(const intrusive_tree&) = delete;
 
     void clear() { root_ = nullptr; n_ = 0; }   // nodes are owned/freed by the container
-    void swap(intrusive_tree& o) noexcept { using std::swap; swap(root_, o.root_); swap(n_, o.n_); swap(rng_, o.rng_); }
+    void swap(intrusive_tree& o) noexcept { using std::swap; swap(root_, o.root_); swap(n_, o.n_); }
     std::size_t size() const { return n_; }
     bool empty() const { return n_ == 0; }
+    std::int32_t root_height() const { return Ht(root_); }   // for AVL-balance assertions in tests
 
     struct iterator {
         const intrusive_tree* tree = nullptr;
@@ -460,19 +491,10 @@ public:
             NodePtr e = lb(p);
             if (e && !Compare{}(p, e)) { conflict = e; return false; }
         }
-        link_in(p);
+        avl_insert(p);
         return true;
     }
-    void erase_node(NodePtr z) {
-        while (H(z).l || H(z).r) {
-            if (!H(z).r || (H(z).l && H(H(z).l).prio > H(H(z).r).prio)) rot_right(z);
-            else rot_left(z);
-        }
-        NodePtr p = H(z).up;
-        if (p) { if (H(p).l == z) H(p).l = nullptr; else H(p).r = nullptr; } else root_ = nullptr;
-        for (NodePtr a = p; a; a = H(a).up) --H(a).sz;
-        --n_;
-    }
+    void erase_node(NodePtr z) { avl_erase(z); }
 };
 
 template <std::size_t I, class NodePtr, class Extractor, class Compare, bool Unique, class Alloc>
@@ -1241,6 +1263,8 @@ public:
         // ---- ranked extras (O(log n) via the order-statistics tree) ----
         iterator nth(std::size_t n) const requires (ranked) { return iterator{ core().c.nth(n) }; }
         std::size_t rank(iterator it) const requires (ranked) { return core().c.rank(it.base()); }
+        // test/diagnostic hook: height of the backing AVL tree (ordered/ranked indices)
+        std::int32_t tree_height() const requires (kind == index_kind::ordered) { return core().c.root_height(); }
 
         // ---- sequenced ops ----
         const Value& front() const requires (kind == index_kind::sequenced || kind == index_kind::random_access) { return *begin(); }

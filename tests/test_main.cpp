@@ -10,6 +10,7 @@
 #include <vector>
 #include <map>
 #include <random>
+#include <cmath>
 
 namespace {
 
@@ -350,6 +351,25 @@ void test_ranked_stress() {
     verify();
 }
 
+void test_avl_balance() {
+    std::println("[test] AVL stays balanced (height ~ log2 n under adversarial sorted load)");
+    using T = mic::multi_index_container<int, mic::indexed_by<mic::ranked_unique<"r", mic::identity<int>>>>;
+    T t;
+    const int N = 20000;
+    for (int i = 0; i < N; ++i) t.insert(i);          // sorted: catastrophic for a plain BST
+    auto r = t.get<"r">();
+    const int bound = 2 * static_cast<int>(std::ceil(std::log2(N + 1))) + 2;  // generous AVL bound
+    std::println("  N={} height={} (bound {})", N, r.tree_height(), bound);
+    CHECK(r.tree_height() <= bound);                  // would be ~N if not balancing
+    CHECK(*r.nth(0) == 0);
+    CHECK(*r.nth(N - 1) == N - 1);
+    CHECK(r.rank(r.find(12345)) == 12345);
+    for (int i = 0; i < N; i += 2) r.erase_key(i);    // erase half, recheck balance
+    CHECK(t.size() == static_cast<std::size_t>(N / 2));
+    CHECK(r.tree_height() <= bound);
+    CHECK(*r.nth(0) == 1);
+}
+
 } // namespace
 
 int main() {
@@ -363,6 +383,7 @@ int main() {
     test_modify_preserves_iterators();
     test_pmr();
     test_ranked_stress();
+    test_avl_balance();
 
     std::println("\n{}/{} checks passed", g_checks - g_fail, g_checks);
     return g_fail == 0 ? 0 : 1;
