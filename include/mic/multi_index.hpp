@@ -835,7 +835,7 @@ concept formattable_value =
 // ---------------------------------------------------------------------------
 template <class Value>
 struct insert_error {
-    enum class reason { duplicate_in_unique_index };
+    enum class reason { duplicate_in_unique_index, capacity_exceeded };
     reason           why = reason::duplicate_in_unique_index;
     std::size_t      index_pos = 0;        // which index (0-based) rejected the insert
     std::string_view index_tag;            // ...and its tag, e.g. "by_email"
@@ -1819,6 +1819,52 @@ using multi_index_container =
 template <class Value, class IndexedBy, class Policy = ::mic::standard_policy>
 using multi_index = multi_index_container<Value, IndexedBy, Policy>;
 }
+
+// ---------------------------------------------------------------------------
+//  Fixed-capacity, inline-storage variant. Every allocation (element nodes AND
+//  per-index structures) is served from an arena embedded in the object, so a
+//  static_multi_index does NO heap allocation. When the arena is exhausted an
+//  allocation throws; try_insert / try_emplace translate that into
+//  insert_error::capacity_exceeded (plain insert/emplace propagate the throw,
+//  like std:: containers on OOM). Sized generously for N elements across any
+//  index mix; best for build-mostly-once tables (the monotonic arena reclaims
+//  nothing until the whole container is destroyed, so heavy insert/erase churn
+//  can exhaust capacity early).
+// ---------------------------------------------------------------------------
+namespace detail {
+template <std::size_t Bytes>
+struct inline_arena {                         // first base, so res_ exists before the container base is built
+    alignas(std::max_align_t) std::array<std::byte, Bytes> buf_{};
+    std::pmr::monotonic_buffer_resource res_{ buf_.data(), buf_.size(), std::pmr::null_memory_resource() };
+};
+}
+
+template <class Value, std::size_t N, class IndexedBy>
+class static_multi_index
+    : private detail::inline_arena<N * (sizeof(Value) + 96 * IndexedBy::count + 160) + 8192>,
+      public  pmr::multi_index<Value, IndexedBy>
+{
+    using base = pmr::multi_index<Value, IndexedBy>;
+    static std::unexpected<insert_error<Value>> cap_error() {
+        insert_error<Value> e; e.why = insert_error<Value>::reason::capacity_exceeded; return std::unexpected(e);
+    }
+public:
+    static constexpr std::size_t capacity = N;
+    static_multi_index() : base(&this->res_) {}     // inline_arena base is built first
+    static_multi_index(const static_multi_index&) = delete;   // tied to its inline arena
+    static_multi_index& operator=(const static_multi_index&) = delete;
+
+    std::expected<typename base::iterator, insert_error<Value>> try_insert(const Value& v) {
+        try { return base::try_insert(v); } catch (const std::bad_alloc&) { return cap_error(); }
+    }
+    std::expected<typename base::iterator, insert_error<Value>> try_insert(Value&& v) {
+        try { return base::try_insert(std::move(v)); } catch (const std::bad_alloc&) { return cap_error(); }
+    }
+    template <class... A>
+    std::expected<typename base::iterator, insert_error<Value>> try_emplace(A&&... a) {
+        try { return base::try_emplace(std::forward<A>(a)...); } catch (const std::bad_alloc&) { return cap_error(); }
+    }
+};
 
 // ---------------------------------------------------------------------------
 //  Relational query helpers over ordered indices (lazy, std::generator-based).

@@ -968,6 +968,32 @@ void test_queries() {
 }
 #endif
 
+void test_static_capacity() {
+    std::println("[cov] static_multi_index: inline arena, no heap, capacity_exceeded");
+    using Fixed = mic::static_multi_index<Person, 8, mic::indexed_by<
+        mic::ordered_unique<"by_id", mic::key<&Person::id>>,
+        mic::hashed_unique <"by_name", mic::key<&Person::name>>>>;
+    CHECK(Fixed::capacity == 8);
+    Fixed t;
+    int ok = 0, cap = 0;
+    for (int i = 0; i < 100000; ++i) {
+        auto r = t.try_emplace(i, "d", std::format("n{}", i), 0);
+        if (r) ++ok;
+        else if (r.error().why == mic::insert_error<Person>::reason::capacity_exceeded) ++cap;
+    }
+    CHECK(ok >= 8);                                  // holds at least N with no heap
+    CHECK(cap > 0);                                  // overflow reported, not crashed
+    CHECK(t.size() == static_cast<std::size_t>(ok));
+    CHECK(t.get<"by_id">().find(0) != t.get<"by_id">().end());   // lookups still work
+
+    // duplicate vs capacity: on a NON-full container a clash reports duplicate
+    // (a full container can't even allocate the node, so it reports capacity).
+    Fixed t2;
+    CHECK(t2.try_emplace(1, "d", "x", 0).has_value());
+    auto dup = t2.try_emplace(1, "d", "y", 0);       // same id, room to spare
+    CHECK(!dup && dup.error().why == mic::insert_error<Person>::reason::duplicate_in_unique_index);
+}
+
 void test_aggregate_key() {
     std::println("[cov] aggregate-struct key via free-fn extractor + key_of decomposition");
     struct DS { std::string dept; int salary; auto operator<=>(const DS&) const = default; };
@@ -1019,6 +1045,7 @@ int main() {
 #if MIC_HAS_GENERATOR
     test_queries();
 #endif
+    test_static_capacity();
     test_aggregate_key();
 
     std::println("\n[coverage] {}/{} checks passed", g_checks - g_fail, g_checks);

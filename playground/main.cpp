@@ -4,23 +4,26 @@
 //  Open Playground.sln in Visual Studio, make sure the config is "Debug | x64"
 //  (the toolbar dropdowns), and press F5 / the green Run button.
 //
-//  This is a guided tour: one container of Books, viewed through five different
-//  indices, exercising lookups, ranges, modify/replace, projection, node
-//  handles, std::expected and composite keys. Scroll to "YOUR TURN" at the
-//  bottom and start hacking — the library is header-only in ..\include\mic.
+//  A guided tour of one Book library viewed through several indices, then the
+//  newer toys: open-ended range scans, try_modify / modify_key, relational
+//  equi_join / group_by, std::format introspection, lifecycle observers and a
+//  fixed-capacity static table. Scroll to "YOUR TURN" and start hacking — the
+//  library is header-only in ..\include\mic.
 // =============================================================================
 
 #include <mic/multi_index.hpp>
 
 #include <print>
+#include <format>
 #include <string>
 #include <string_view>
 #include <tuple>
 #include <ranges>
+#include <vector>
 #include <memory>
 
 // -----------------------------------------------------------------------------
-//  Domain: a tiny library of books.
+//  Domain: a tiny library of books (made formattable so "{:full}" can print it).
 // -----------------------------------------------------------------------------
 struct Book {
     int         id;
@@ -28,18 +31,21 @@ struct Book {
     std::string author;
     int         year;
 };
+template <> struct std::formatter<Book> : std::formatter<std::string> {
+    auto format(const Book& b, std::format_context& ctx) const {
+        return std::formatter<std::string>::format(
+            std::format("#{} {} ({}, {})", b.id, b.title, b.author, b.year), ctx);
+    }
+};
 
-// Five views over the same Book objects (one physical copy per book, threaded
-// into every index). Note each index just names a different key:
-//
 //   by_id          ordered, unique         primary key
 //   by_author      ordered, duplicates ok  many books per author
 //   by_title       hashed, unique          O(1) exact-title lookup
 //   by_year        ranked, duplicates ok   order statistics (nth / rank)
-//   by_author_year ordered composite       (author, year) prefix queries
-using Library = mic::multi_index_container<Book,
+//   by_author_year ordered composite       (author, year) prefix + range queries
+using Library = mic::multi_index<Book,
     mic::indexed_by<
-        mic::ordered_unique     <"by_id",          mic::key<&Book::id>>,
+        mic::ordered_unique     <"by_id",           mic::key<&Book::id>>,
         mic::ordered_non_unique <"by_author",       mic::key<&Book::author>>,
         mic::hashed_unique      <"by_title",        mic::key<&Book::title>>,
         mic::ranked_non_unique  <"by_year",         mic::key<&Book::year>>,
@@ -58,15 +64,11 @@ int main() {
     lib.insert(Book{1, "The C++ Programming Language", "Stroustrup", 2013});
     lib.insert(Book{2, "Effective Modern C++",         "Meyers",     2014});
     lib.insert(Book{3, "A Tour of C++",                "Stroustrup", 2022});
-    lib.emplace(4, "Effective C++",                    "Meyers",     2005);  // emplace = in-place
+    lib.emplace(4, "Effective C++",                    "Meyers",     2005);
     lib.emplace(5, "C++ Concurrency in Action",        "Williams",   2019);
-
     std::println("Loaded {} books.  {}", lib.size(), std::format("{}", lib));
 
     // ---- iterate through different indices --------------------------------
-    heading("by id (ordered, unique)");
-    for (const Book& b : lib.get<"by_id">()) show(b);
-
     heading("by author (ordered, duplicates kept)");
     for (const Book& b : lib.get<"by_author">()) show(b);
 
@@ -75,108 +77,118 @@ int main() {
     std::println("  find by title (hashed):  \"A Tour of C++\" -> {}",
                  lib.get<"by_title">().find("A Tour of C++")->author);
     std::println("  count by author:         Meyers wrote {}", lib.get<"by_author">().count("Meyers"));
-    std::println("  contains id 5?           {}", lib.get<"by_id">().contains(5));
-
-    std::println("  equal_range by author:   Stroustrup ->");
-    auto [lo, hi] = lib.get<"by_author">().equal_range("Stroustrup");
-    for (auto it = lo; it != hi; ++it) show(*it);
 
     // ---- ranked index: order statistics -----------------------------------
     heading("ranked by year (nth / rank)");
     auto byYear = lib.get<"by_year">();
     std::println("  oldest (nth 0):          {} ({})", byYear.nth(0)->title, byYear.nth(0)->year);
-    std::println("  newest (nth size-1):     {} ({})",
-                 byYear.nth(lib.size() - 1)->title, byYear.nth(lib.size() - 1)->year);
     std::println("  rank of 'A Tour of C++': {}", byYear.rank(byYear.find(2022)));
 
     // ---- ranges adaptors over an index ------------------------------------
     heading("std::ranges over indices");
-    std::print("  three newest:           ");
+    std::print("  three newest years:     ");
     for (const Book& b : lib.get<"by_year">() | std::views::reverse | std::views::take(3))
         std::print(" {}", b.year);
     std::println();
 
-    std::print("  Stroustrup titles:      ");
-    for (const Book& b : lib.get<"by_id">()
-            | std::views::filter([](const Book& b) { return b.author == "Stroustrup"; }))
-        std::print(" \"{}\"", b.title);
-    std::println();
-
-    // ---- composite key: (author, year) prefix query -----------------------
-    heading("composite key prefix query");
-    std::println("  all Meyers books, oldest first (prefix on author):");
-    auto [m0, m1] = lib.get<"by_author_year">().equal_range(std::tuple{std::string("Meyers")});
+    // ---- composite key: prefix + open-ended range -------------------------
+    heading("composite key: prefix & range()");
+    auto [m0, m1] = lib.get<"by_author_year">().equal_range(mic::prefix(std::string("Meyers")));
+    std::println("  all Meyers books (prefix on author):");
     for (auto it = m0; it != m1; ++it) show(*it);
+    std::println("  Stroustrup books from 2015 onward (range with key_ge):");
+    auto recent = lib.get<"by_author_year">().range(
+        mic::key_ge(std::tuple{std::string("Stroustrup"), 2015}),
+        mic::key_le(mic::prefix(std::string("Stroustrup"))));
+    for (const Book& b : recent) show(b);
 
-    // ---- modify (repositions across every index) --------------------------
-    heading("modify");
+    // ---- modify / try_modify / modify_key ---------------------------------
+    heading("modify / try_modify / modify_key");
     {
         auto it = lib.get<"by_id">().find(4);
-        std::println("  before: {} ({})", it->title, it->year);
-        lib.get<"by_id">().modify(it, [](Book& b) { b.year = 2001; });  // re-sorts by_year
-        std::println("  after:  {} ({})  -> oldest is now {}",
-                     it->title, it->year, lib.get<"by_year">().nth(0)->title);
+        lib.get<"by_id">().modify(it, [](Book& b) { b.year = 2001; });   // re-sorts by_year
+        std::println("  modify year -> oldest is now {}", lib.get<"by_year">().nth(0)->title);
+
+        // try_modify names the index that blocks a clashing key change
+        auto r = lib.get<"by_id">().try_modify(it, [](Book& b) { b.title = "A Tour of C++"; });
+        std::println("  try_modify to a taken title -> {}",
+                     r ? "ok" : std::format("rejected by '{}'", r.error().index_tag));
+
+        // modify_key edits just the key, through the index that owns it
+        lib.get<"by_year">().modify_key(lib.project<"by_year">(it), [](int& y) { y += 1; });
+        std::println("  modify_key bumped the year to {}", it->year);
     }
 
-    // ---- projection: jump between indices in O(1) -------------------------
+    // ---- projection -------------------------------------------------------
     heading("projection");
     {
-        auto t = lib.get<"by_title">().find("A Tour of C++");   // hashed iterator
-        auto a = lib.project<"by_author">(t);                   // same book, author index
+        auto t = lib.get<"by_title">().find("A Tour of C++");
+        auto a = lib.project<"by_author">(t);
         std::println("  found via title, viewed in author index: {} by {}", a->title, a->author);
     }
 
-    // ---- std::expected fallible insert ------------------------------------
-    heading("try_insert (std::expected)");
-    {
-        auto r = lib.try_insert(Book{1, "Imposter", "Nobody", 2000});  // id 1 already exists
-        if (!r)
-            std::println("  rejected by index '{}' (duplicate key)", r.error().index_tag);
-        else
-            std::println("  inserted");
-    }
+    // ---- relational queries: equi_join + group_by -------------------------
+#if MIC_HAS_GENERATOR
+    heading("relational queries (equi_join / group_by)");
+    struct Author { std::string name; std::string country; };
+    using Authors = mic::multi_index<Author, mic::indexed_by<
+        mic::ordered_non_unique<"by_name", mic::key<&Author::name>>>>;
+    Authors authors;
+    authors.insert({"Stroustrup", "DK"});
+    authors.insert({"Meyers",     "US"});
+    // INNER JOIN books to author bios on author name:
+    for (auto&& [book, author] : mic::queries::equi_join(lib.get<"by_author">(), authors.get<"by_name">()))
+        std::println("  {:<28} <- {} ({})", book.title, author.name, author.country);
+    // GROUP BY author:
+    std::println("  books per author:");
+    for (auto&& [name, group] : mic::queries::group_by(lib.get<"by_author">()))
+        std::println("    {:<12} {}", name, std::ranges::distance(group));
+#endif
 
-    // ---- node handle: re-key without a copy -------------------------------
-    heading("node handle (extract / re-key / re-insert)");
-    {
-        auto nh = lib.extract(lib.get<"by_id">().find(5));      // detach from all indices
-        std::println("  extracted '{}'; size now {}", nh.value().title, lib.size());
-        nh.value().id = 50;                                     // safe: detached, re-key freely
-        auto res = lib.insert(std::move(nh));                   // re-thread under new id
-        std::println("  re-inserted under id 50: ok={}, size {}", res.inserted, lib.size());
-    }
+    // ---- std::format introspection ----------------------------------------
+    heading("std::format introspection");
+    std::println("{:stats}", lib);
+    std::println("{:audit}", lib);
+    std::println("  by_title load_factor = {:.2f}", lib.stats().index<"by_title">().load_factor);
+    std::println("  books in year order:\n{:index=by_year}", lib);
 
-    // ---- erase ------------------------------------------------------------
-    heading("erase");
-    std::println("  erase_key by_id(2) removed {} book(s); {} remain",
-                 lib.get<"by_id">().erase_key(2), lib.size());
+    // ---- lifecycle observers ----------------------------------------------
+    heading("observers (mic::observed + RAII token)");
+    {
+        using Watched = mic::observed<Book, mic::indexed_by<
+            mic::ordered_unique<"by_id", mic::key<&Book::id>>>>;
+        Watched w;
+        auto token = w.subscribe({
+            .on_insert = [](const Book& b) { std::println("    + added '{}'", b.title); },
+            .on_erase  = [](const Book& b) { std::println("    - removed '{}'", b.title); },
+        });
+        w.insert(Book{1, "Observed", "You", 2024});
+        w.get<"by_id">().erase(w.get<"by_id">().find(1));
+    } // token dropped -> observation stops
+
+    // ---- fixed-capacity inline table (no heap) ----------------------------
+    heading("static_multi_index (inline arena, no heap)");
+    {
+        using Fixed = mic::static_multi_index<Book, /*N=*/4,
+            mic::indexed_by<mic::ordered_unique<"by_id", mic::key<&Book::id>>>>;
+        Fixed fixed;
+        int placed = 0, full = 0;
+        for (int i = 0; i < 100; ++i) {
+            auto r = fixed.try_emplace(i, std::format("b{}", i), "anon", 2000);
+            if (r) ++placed; else ++full;
+        }
+        std::println("  capacity>={}, placed {} with zero heap, {} capacity_exceeded",
+                     Fixed::capacity, placed, full);
+    }
 
     // =======================================================================
     //  YOUR TURN — mess about below. Ideas:
-    //
     //    * Add a 6th index and query it.
-    //    * lib.get<"by_id">().replace(it, newBook);
+    //    * lib.get<"by_id">().replace(it, newBook);  or try_replace
     //    * Build the container from a vector with std::from_range.
-    //    * Iterate by_author_year and watch books sort by (author, then year).
-    //    * Swap two Library instances, or copy one and compare.
+    //    * equi_join two of your own containers; group_by something.
+    //    * Print "{:full}" of lib (Book is formattable above).
     // =======================================================================
-
-    // ---- bonus: key-mutation safety with shared_ptr elements --------------
-    //  Storing shared_ptr<Book> lets `it->id = x` compile and corrupt the index.
-    //  const_element_container hands out a *const* pointee instead, so keys can
-    //  only change via modify(). Uncomment the marked line to see it refuse.
-    heading("bonus: const_element_container (pointer-element safety)");
-    {
-        using SafeLib = mic::const_element_container<std::shared_ptr<Book>,
-            mic::indexed_by<mic::ordered_unique<"by_id", mic::key<&Book::id>>>>;
-        SafeLib s;
-        s.insert(std::make_shared<Book>(1, "Safe", "You", 2024));
-        const Book& b = *s.get<"by_id">().find(1);   // iterator yields const Book&
-        std::println("  read-only view: {} ({})", b.title, b.year);
-        // b.id = 99;   // <-- uncomment: compile error C3490 (key is immutable)
-        s.get<"by_id">().modify(s.get<"by_id">().find(1), [](auto& p) { p->title = "Still Safe"; });
-        std::println("  changed via modify(): {}", s.get<"by_id">().find(1)->title);
-    }
 
     std::println("\nDone.");
     return 0;
